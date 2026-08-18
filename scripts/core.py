@@ -1,21 +1,20 @@
 # -*- coding: utf-8 -*-
-"""
-core.py — Self-contained V2Ray config processing engine for the aggregator.
+"""Standalone V2Ray config processing engine for the aggregator.
 
-این ماژول منطق اثبات‌شدهٔ ربات RaydikalxBot را به‌صورت standalone (بدون وابستگی
-به دیتابیس/تلگرام) بازنویسی می‌کند تا داخل GitHub Actions اجرا شود:
+This is the proven RaydikalxBot logic rewritten self-contained, without the
+Telegram/database dependencies, so it can run inside GitHub Actions:
 
-  • _dedup_key()                  → اثرانگشت هویتِ سرور (CDN-aware)
-  • _is_dummy_config()           → تشخیص کانفیگ خراب/جعلی
-  • _detect_country_from_remark()→ تشخیص کشور (پرچم + کد + کلیدواژه)
-  • brand_remark()               → برندینگ: «{CC} {flag} | @Raydikalx | {idx}»
-  • protocol_of()                → تشخیص پروتکل یک کانفیگ
-  • try_base64_decode()          → دیکد امن base64 (با بررسی کیفیت)
-  • extract_valid_lines()        → استخراج خطوط کانفیگ معتبر از یک blob
-  • _normalize_packet_encoding() → حذفِ `packetEncoding`ِ ناسازگار با sing-box
+  * dedup_key()                  server identity fingerprint, CDN aware
+  * is_dummy_config()            broken / fake config detection
+  * detect_country_from_remark() country detection from the remark, fallback only
+  * brand_remark()               branding: "{CC} {flag} | @Raydikalx | {tag}"
+  * protocol_of()                protocol detection
+  * try_base64_decode()          safe base64 decode with a quality gate
+  * extract_valid_lines()        valid config extraction from a blob
+  * _normalize_packet_encoding() strips packetEncoding that crashes Hiddify
 
-منبع منطق: raydikalx/freeconfigs.py , raydikalx/fetcher.py , raydikalx/subscription.py
-(کاملاً معادل، فقط مستقل و قابل اجرا در محیط CI)
+Source logic: raydikalx/freeconfigs.py, fetcher.py, subscription.py.
+Equivalent behaviour, only made standalone and CI-runnable.
 """
 from __future__ import annotations
 
@@ -25,105 +24,71 @@ import json
 import os
 import re
 import urllib.parse
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ثابت‌ها
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+# Constants
+# --------------------------------------------------------------------------- #
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 🔒 سیاستِ برندینگ — تصمیمِ مالکِ مخزن، غیرِقابلِ مذاکره
-# ══════════════════════════════════════════════════════════════════════════════
-# برندینگ یک «انتخابِ سلیقه‌ای» یا بدهیِ فنی نیست؛ **الزامِ محصول** است. مالکِ
-# مخزن صریحاً اعلام کرده:
+# Branding policy: product requirement, not taste.
 #
-#     «بله برندینگ و اضافه کردن آیدی @Raydikalx عمدی است و میخواهم انجام شود
-#      و به هیچ وجه نمیخوام برندینگ حذف شود یا انجام نشود
-#      میخواهم *همیشه* آیدی کانالم @Raydikalx روی کانفیگ ها نوشته شود»
+# The repo owner was explicit: branding is intentional, must stay, and the channel
+# id @Raydikalx must always be written onto configs. So this invariant is not
+# negotiable:
 #
-# پس ناوردایِ زیر باید همیشه برقرار باشد:
+#   every published node, in configs.txt, configs_base64.txt, clash.yaml,
+#   singbox.json, protocols/* and archive/*, must carry BRAND_CHANNEL in its
+#   remark, name or tag.
 #
-#     هر نودی که منتشر می‌شود — در `configs.txt`، `configs_base64.txt`،
-#     `clash.yaml`، `singbox.json`، `protocols/*` و `archive/*` — باید
-#     `BRAND_CHANNEL` را در ریمارک/نام/تگِ خود داشته باشد.
-#
-# ⚠️ برای هر کسی که بعداً این کد را می‌خواند (انسان یا عامل):
-#
-#   • «کاهشِ برندینگ» **رگرسیون** است، نه بهبود. نسخه‌های قدیمیِ نقشهٔ راه یک
-#     آیتم به نامِ D-7 داشتند با عنوانِ «کاهشِ برندینگ به <۵٪». آن آیتم رسماً
-#     `WON'T DO` شده است. اگر جایی آن را دیدید، سند قدیمی است — کد درست است.
-#   • fallbackهای «بی‌برند» در `converters.py` هم عمداً به مقدارِ **برنددار**
-#     هدف‌گیری شده‌اند؛ برگرداندنشان به `"vmess"`/`scheme`/`type` رگرسیون است.
-#   • برندینگ **idempotent** است (اندازه‌گیری‌شده: ۴ نمونه × ۵ اعمالِ متوالی
-#     ⇒ از نخستین اعمال پایدار)، پس اعمالِ دوباره‌اش بی‌خطر است. به همین دلیل
-#     `aggregate.py` یک دروازهٔ fail-safe دارد که خطِ بی‌برند را دوباره برند
-#     می‌زند و در نهایت — اگر بازهم بی‌برند بود — همان **یک خط** را کنار
-#     می‌گذارد و در `health.json` می‌شمارد. هرگز کلِ اجرا را نمی‌شکند.
-#   • تست‌های `test_pipeline.py` این ناوردا را روی هر ۴ قالبِ خروجی قفل
-#     کرده‌اند. اگر تستی به‌خاطرِ «برند» شکست، تست درست است.
-# ══════════════════════════════════════════════════════════════════════════════
-
-#: برند کانال — تنها جای تعریف
+# Consequences for future readers, human or agent:
+#   - reducing branding is a regression, not an improvement. Old planning docs may
+#     mention "reduce branding to <5%"; that item is explicitly won't-do.
+#   - unbranded fallbacks in converters.py are intentionally aimed at a branded
+#     value. Reverting them to "vmess" / scheme / type is a regression.
+#   - branding is idempotent, measured over repeated application, so reapplying it
+#     is safe. That is why aggregate.py has a fail-safe gate that retries branding
+#     once and, only if the line is still unbranded, drops just that line and
+#     counts it in health.json. It never breaks the whole run.
+#   - test_pipeline.py locks this invariant over all four output formats. If a test
+#     fails because of the brand, the test is right.
 BRAND_CHANNEL = "@Raydikalx"
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 🪪 سرآیندِ درون‌فایلیِ Hiddify (in-file profile headers)
-# ══════════════════════════════════════════════════════════════════════════════
-# Hiddify علاوه بر هدرهای HTTP، **خودِ بدنهٔ اشتراک** را هم برای متادیتا
-# می‌خواند. این رفتار حدس نیست؛ از سورس خوانده و با یک replicaِ کلمه‌به‌کلمهٔ
-# Go اندازه‌گیری شد (`hcfull/v2/profile/profile_parser.go`):
+# Hiddify in-file profile headers.
 #
-#   ۱) `profile_repository.go:281-284` بدنه را به `parseHeadersFromContent`
-#      می‌دهد و نتیجه را با `resp.Header.Set(k, v[0])` روی هدرهای HTTP
-#      **می‌نشاند** — یعنی سرآیندِ درون‌فایلی هدرِ HTTP را هم override می‌کند.
-#   ۲) `parseHeadersFromContent` (خط ۱۵۳-۱۸۱) اول `safeDecodeBase64` می‌زند،
-#      پس این سرآیندها **داخلِ payloadِ base64 هم** کار می‌کنند.
-#   ۳) `strings.SplitN(content, "\n", 30)` و حلقهٔ `i < len(lines)-1` ⇒ تنها
-#      **۲۹ خطِ نخست** پویش می‌شود. اندازه‌گیری شد: با ۳۰ خط padding همهٔ
-#      سرآیندها ناپدید می‌شوند، با ۲۳ خط هنوز خوانده می‌شوند. به همین دلیل
-#      این بلوک **همیشه اولین چیزِ فایل** است.
-#   ۴) خط باید با `#` یا `//` شروع شود (بدون فاصلهٔ ابتدایی) و یک `:` داشته
-#      باشد که کاراکترِ بعدش `/` نباشد (تا URLِ خالی سرآیند حساب نشود).
+# Hiddify reads metadata not only from HTTP headers but also from the subscription
+# body itself. That was read from source and reproduced exactly with a Go replica:
 #
-# چرا `subscription-userinfo` اجباری است: در `ProfileEntity.Parse` خطوط
-# ۸۰-۸۷، هر دوی `Profile-Web-Page-Url` و `Support-Url` **تنها وقتی**
-# اعمال می‌شوند که `subInfo != nil` باشد. و `parseSubscriptionInfo` هیچ
-# مسیرِ بازگشتِ nil ندارد ⇒ صرفِ *وجودِ* این سرآیند کافی است. بدونِ آن، آن دو
-# لینک بی‌صدا دور ریخته می‌شوند (اندازه‌گیری شد).
+#   1. profile_repository.go feeds the body into parseHeadersFromContent and then
+#      writes the result back onto the HTTP header map, so in-file headers
+#      override HTTP headers.
+#   2. parseHeadersFromContent first calls safeDecodeBase64, so these headers also
+#      work *inside a base64 payload*.
+#   3. strings.SplitN(content, "\n", 30) and iterating to len(lines)-1 means only
+#      the first 29 lines are scanned. Measured: 30 lines of padding hide the
+#      headers, 23 still work. So this block must be the first thing in the file.
+#   4. The line must start with `#` or `//` with no leading space and contain a
+#      `:` not followed by `/`, so an empty URL is not mistaken for a header.
 #
-# `total=0` و `expire=0` عمدی‌اند: در همان تابع به `infiniteTrafficThreshold`
-# و `infiniteTimeThreshold` نگاشت می‌شوند ⇒ Hiddify «نامحدود» نشان می‌دهد،
-# که برای یک اشتراکِ عمومیِ رایگان صادق‌ترین حالت است.
+# Why subscription-userinfo is mandatory: in ProfileEntity.Parse,
+# Profile-Web-Page-Url and Support-Url are only applied when subInfo != nil, and
+# parseSubscriptionInfo never returns nil. So the mere *presence* of that header is
+# enough. Without it, the two URLs are dropped silently, measured.
 #
-# ⚠️ این بلوک به `singbox.json` **اضافه نمی‌شود**: گرچه خودِ Hiddify با
-#    `SJ.NewCommentFilter` کامنت را تحمل می‌کند، مصرف‌کنندگانِ استانداردِ JSON
-#    (از جمله `jq` و `validate.py::check_singbox` که `json.load` می‌زند)
-#    می‌شکنند — اندازه‌گیری شد: `json.loads(header + singbox)` ⇒ JSONDecodeError.
-#    به `archive/*` هم اضافه نمی‌شود، چون آن‌ها آرتیفکتِ عیب‌یابی‌اند نه اشتراک.
-
-#: بازهٔ به‌روزرسانی که به کلاینت پیشنهاد می‌شود — **بر حسبِ ساعت**.
-#: `Parse` مقدار را با `time.ParseDuration(v + "h")` می‌خواند، پس باید عددِ
-#: برهنه باشد. عمداً «۱» (عددِ صحیح) است نه کسری: هم Go آن را می‌پذیرد و هم
-#: کلاینت‌هایی که ساده‌لوحانه int-parse می‌کنند. عددِ کسری مثل `0.25` هم معتبر
-#: است (اندازه‌گیری شد: 900000ms) ولی هر کلاینت را هر ۱۵ دقیقه به raw
-#: می‌فرستد که برای یک اشتراکِ عمومی بار زیادی است.
+# total=0 and expire=0 are deliberate: they map to Hiddify's infinity thresholds,
+# so the client shows "unlimited", which is the most honest state for a free public
+# subscription.
+#
+# This block is *not* added to singbox.json: Hiddify's own JSON parser tolerates
+# comments, but standard JSON consumers do not, including jq and
+# validate.py::check_singbox (json.load). Measured: json.loads(header + singbox)
+# raises JSONDecodeError. It is also not added to archive/*, which are debugging
+# artefacts rather than subscriptions.
 HIDDIFY_UPDATE_INTERVAL_HOURS = os.environ.get("AGG_HIDDIFY_UPDATE_HOURS", "1")
-
-#: لینکِ پشتیبانی — **از روی برند ساخته می‌شود**، پس نمی‌تواند از آن واگرا شود.
 SUPPORT_URL = os.environ.get(
     "AGG_SUPPORT_URL", "https://t.me/" + BRAND_CHANNEL.lstrip("@").lower())
-
-#: صفحهٔ پروژه. تستِ `test_zzz_hdr_project_and_support_urls_cannot_drift` این
-#: را به `aggregate.GH_USER`/`GH_REPO` قفل می‌کند تا واگرایی بی‌صدا رخ ندهد.
-#: (عمداً از `aggregate` import نمی‌شود: `aggregate` خودش `core` را import
-#:  می‌کند و وارونه‌کردنش حلقهٔ import می‌سازد.)
 PROJECT_URL = os.environ.get(
     "AGG_PROJECT_URL", "https://github.com/0xRadikal/Free-v2ray-Configs")
-
-#: `total=0`/`expire=0` ⇒ «نامحدود» (به آستانه‌های بی‌نهایت نگاشت می‌شوند).
 HIDDIFY_SUBSCRIPTION_USERINFO = "upload=0; download=0; total=0; expire=0"
-
-#: کلیدهایی که این بلوک تولید می‌کند — تست‌ها از همین می‌خوانند.
 HIDDIFY_HEADER_KEYS = (
     "profile-title",
     "profile-update-interval",
@@ -134,14 +99,14 @@ HIDDIFY_HEADER_KEYS = (
 
 
 def hiddify_profile_header(label: str) -> str:
-    """بلوکِ ۵ خطیِ سرآیندِ Hiddify برای یک فایلِ اشتراک.
+    """Five-line Hiddify header block for a subscription file.
 
-    خروجی همیشه با `\\n` تمام می‌شود تا فراخوان بتواند مستقیم به ابتدای
-    هر فرمتِ متنی (txt / payloadِ base64 / yaml) بچسباندش.
+    Always ends with ``\n`` so callers can prepend it directly to any text format
+    (txt, base64 payload, yaml).
 
-    `label` نامِ خوانا برای کاربر است (مثلاً `ALL` یا `TOP 100`). عنوانِ
-    نهایی `@Raydikalx — LABEL` می‌شود؛ حرفِ غیر-ASCII (em-dash) اندازه‌گیری
-    شد و بی‌مشکل از `Parse` رد می‌شود.
+    `label` is the human-readable category, e.g. ALL or TOP 100. The final title
+    is ``@Raydikalx — LABEL``. The em dash was measured and passes Hiddify's
+    parser fine.
     """
     title = f"{BRAND_CHANNEL} — {label}".strip()
     return (
@@ -152,16 +117,12 @@ def hiddify_profile_header(label: str) -> str:
         f"#profile-web-page-url: {PROJECT_URL}\n"
     )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 🧠 تشخیصِ هوشمندِ پروتکل (Dynamic / Future-proof)
-# ──────────────────────────────────────────────────────────────────────────────
-# سیستم به‌جای «لیستِ سفیدِ ثابت»، هر URI به‌شکلِ scheme://... را به‌عنوان یک
-# کانفیگِ معتبر می‌پذیرد (مگر اینکه در لیستِ سیاهِ scheme‌های غیرپروکسی باشد).
-# بنابراین اگر منابع فردا پروتکلِ جدیدی اضافه کنند (مثلاً anytls، juicity، snell،
-# mieru، ssh، و…)، خودکار شناسایی، تجمیع، تکراری‌زدایی و دسته‌بندی می‌شود —
-# بدونِ نیاز به تغییرِ کد.
-
-#: نگاشتِ aliasهای شناخته‌شده → نامِ canonical (فقط برای تمیزی نام؛ نه محدودیت)
+# Smart protocol detection: dynamic, future-proof.
+#
+# Instead of a fixed allow-list, any URI shaped like scheme://... is accepted as a
+# config unless its scheme is in the non-proxy deny-list. So if sources add a new
+# protocol tomorrow (anytls, juicity, snell, mieru, ssh, ...), it is detected,
+# aggregated, deduplicated and categorised automatically without a code change.
 _SCHEME_ALIASES: Dict[str, str] = {
     "ss": "shadowsocks",
     "shadowsocks": "shadowsocks",
@@ -177,22 +138,22 @@ _SCHEME_ALIASES: Dict[str, str] = {
     "socks5": "socks",
 }
 
-#: scheme‌هایی که «پروکسی» نیستند و باید نادیده گرفته شوند (لیستِ سیاه)
-#: (لینک‌های وب، فایل، تصویر و…)، تا متنِ نویزِ منابع به‌اشتباه کانفیگ تلقی نشود.
+#: Non-proxy schemes to ignore entirely, so noisy source text is not treated as a
+#: config.
 _NON_PROXY_SCHEMES: frozenset = frozenset({
     "http", "https", "ftp", "ftps", "file", "data", "mailto", "tel", "sms",
     "magnet", "git", "ssh+git", "ws", "wss", "tcp", "udp", "ipfs",
     "android-app", "intent", "javascript", "blob", "about", "chrome",
 })
 
-#: الگوی یک URI پروکسی:  scheme://...   (scheme معتبرِ RFC: حروف/عدد/+/-/.)
+#: A proxy URI scheme: scheme://..., where scheme follows the RFC grammar.
 _URI_SCHEME_RE = re.compile(r"^([a-z][a-z0-9+\-.]*)://", re.IGNORECASE)
 
-#: حداقل طولِ یک کانفیگِ معتبر (کوتاه‌تر از این = نویز)
+#: Anything shorter than this is noise, not a usable config.
 _MIN_CONFIG_LEN = 12
 
-#: ترتیبِ ترجیحیِ نمایشِ پروتکل‌های پرکاربرد در خروجی/متادیتا.
-#: پروتکل‌های ناشناخته/جدید بعد از این‌ها به‌ترتیبِ الفبا می‌آیند (خودکار).
+#: Preferred display order for well-known protocols. Unknown/new ones come after
+#: these in alphabetical order.
 PROTOCOL_ORDER: Tuple[str, ...] = (
     "vless", "vmess", "trojan", "shadowsocks", "shadowsocksr",
     "hysteria2", "hysteria", "tuic", "wireguard",
@@ -201,64 +162,43 @@ PROTOCOL_ORDER: Tuple[str, ...] = (
 
 
 def normalize_scheme(scheme: str) -> str:
-    """نامِ scheme را به نامِ canonical پروتکل تبدیل می‌کند (هوشمند، با fallback)."""
-    s = (scheme or "").strip().lower()
-    return _SCHEME_ALIASES.get(s, s)
+    """Canonical protocol name for a scheme, with a safe fallback."""
+    value = (scheme or "").strip().lower()
+    return _SCHEME_ALIASES.get(value, value)
 
 
 def is_proxy_config(line: str) -> bool:
-    """
-    تشخیصِ هوشمندِ اینکه آیا یک خط، کانفیگِ پروکسیِ معتبر است.
+    """Smart detection of whether a line is a valid proxy config.
 
-    منطق (future-proof):
-      • باید الگوی scheme:// داشته باشد
-      • scheme نباید در لیستِ سیاهِ غیرپروکسی باشد (http, ws, file, …)
-      • طولِ کافی داشته باشد و حاوی فاصلهٔ خالی نباشد (URIهای واقعی فاصله ندارند)
-    هر پروتکلِ جدیدی که این شرایط را داشته باشد، خودکار پذیرفته می‌شود.
+    Rules:
+      - it must look like ``scheme://``
+      - the scheme must not be in the non-proxy deny-list
+      - it must be long enough and contain no spaces before the fragment
+
+    Any future protocol that satisfies those rules is accepted automatically.
     """
     if not line:
         return False
     line = line.strip()
     if len(line) < _MIN_CONFIG_LEN or " " in line.split("#", 1)[0]:
         return False
-    m = _URI_SCHEME_RE.match(line)
-    if not m:
+    match = _URI_SCHEME_RE.match(line)
+    if not match:
         return False
-    scheme = m.group(1).lower()
+    scheme = match.group(1).lower()
     if scheme in _NON_PROXY_SCHEMES:
         return False
-    # باید بعد از :// محتوای واقعی داشته باشد
     after = line.split("://", 1)[1]
     return bool(after) and not after.startswith(("/", "#"))
 
+# A former VALID_PREFIXES allow-list was removed on purpose, not forgotten. It had
+# exactly one live occurrence, its own definition, while the real design here is a
+# deny-list via is_proxy_config(). Keeping a dead allow-list beside it is the same
+# future bug pattern validate.py had to fix: two truths that drift. That tuple had
+# already drifted measurably, with seven non-canonical aliases and no
+# shadowsocksr.
 
-#: ⚠️ در این‌جا یک `VALID_PREFIXES` بود — یک تاپلِ ۲۰تاییِ prefixهای پروتکل — با
-#: این توضیح که «برخی توابع قدیمی هنوز به این نام رجوع می‌کنند» و «برای
-#: heuristicِ تشخیصِ base64 به کار می‌رود». هر دو ادعا با اندازه‌گیری **غلط**
-#: از کار درآمد و خودِ نام هم مرده بود:
-#:
-#:   ۱) جست‌وجویِ کلِ مخزن (به‌جز `node_modules` و `.git`) دقیقاً **۱ مورد**
-#:      داد: همان خطِ تعریفِ خودش. صفر مصرف‌کننده. `core.py` هم انتسابِ
-#:      `__all__` ندارد (با AST سنجیده شد، نه با grep — چون grep همین خطِ
-#:      توضیح را هم می‌شمارد) و `scripts/` بسته‌ای نصب‌شدنی نیست (نه
-#:      `pyproject.toml`، نه `setup.py`، نه `setup.cfg`، نه `__init__.py`؛
-#:      هر چهار مورد اندازه‌گیری شد)، پس «مصرف‌کنندهٔ بیرونی» هم ممکن نبود.
-#:   ۲) مسیرِ واقعیِ base64 (`_B64_BODY_RE` / `decode_base64_text()` /
-#:      `_ssr_b64_text()`) خوانده شد و هیچ‌کدام این نام را صدا نمی‌زنند.
-#:
-#: مهم‌تر از مرده‌بودن: این تاپل با طرحِ زندهٔ ماژول **در تضاد** بود. پذیرش
-#: امروز با `is_proxy_config()` انجام می‌شود که فهرستِ سیاه (`_NON_PROXY_SCHEMES`)
-#: است تا هر پروتکلِ تازه خودکار پذیرفته شود. یک allowlistِ ثابتِ کنارِ آن،
-#: دعوت‌نامهٔ همان باگی است که در F-5 در `validate.py` رفع شد. دریفتِ
-#: اندازه‌گیری‌شدهٔ همین تاپل نشان می‌دهد قبلاً هم پوسیده بود: نسبت به
-#: `PROTOCOL_ORDER` هفت نامِ غیرcanonical داشت (`hy`, `hy2`, `socks5`, `ss`,
-#: `ssr`, `warp`, `wg`) و `shadowsocksr` را جا انداخته بود. پس حذف شد، نه
-#: اینکه به‌روز شود — چون هیچ‌کس به آن نیاز نداشت.
-
-# ──────────────────────────────────────────────────────────────────────────────
-# تشخیص کشور (vendored از freeconfigs.py)
-# ──────────────────────────────────────────────────────────────────────────────
-
+# Country detection from the remark, vendored from freeconfigs.py.
 _FLAG_EMOJI_RE = re.compile(r"[\U0001F1E6-\U0001F1FF]{2}")
 
 _COUNTRY_KEYWORD_MAP: Dict[str, Tuple[str, str]] = {
@@ -322,8 +262,9 @@ _COUNTRY_KEYWORD_MAP: Dict[str, Tuple[str, str]] = {
     "mexico": ("MX", "🇲🇽"), "مکزیک": ("MX", "🇲🇽"),
 }
 
-_VALID_CC = frozenset(v[0] for v in _COUNTRY_KEYWORD_MAP.values())
-_SORTED_KEYWORDS = sorted(_COUNTRY_KEYWORD_MAP.items(), key=lambda x: len(x[0]), reverse=True)
+_VALID_CC = frozenset(value[0] for value in _COUNTRY_KEYWORD_MAP.values())
+_SORTED_KEYWORDS = sorted(_COUNTRY_KEYWORD_MAP.items(),
+                          key=lambda item: len(item[0]), reverse=True)
 
 
 def _flag_to_country_code(flag: str) -> Optional[str]:
@@ -339,47 +280,43 @@ def _flag_to_country_code(flag: str) -> Optional[str]:
 
 
 def detect_country_from_remark(remark: str) -> Tuple[str, str]:
-    """
-    تشخیصِ کشور از روی متنِ ریمارک — تنها به‌عنوانِ چارهٔ آخر.
+    """Country detection from the remark, last resort only.
 
-    این تابع پیش از این منبعِ *اصلیِ* برچسبِ کشور بود و سه مرحله داشت. مرحلهٔ
-    سوم هر واژهٔ دوحرفیِ لاتین را کدِ کشور فرض می‌کرد، که یک حدس بود نه یک
-    اندازه‌گیری. نمونه‌های واقعی از خروجیِ همین مخزن:
+    This used to be the *main* country source and had three stages. The last
+    stage assumed any two-letter Latin word was a country code, which was a guess,
+    not a measurement. Real examples from this repo's output:
 
-        «join-us-on-Telegram»      → US   (واژهٔ «us» انگلیسی است، نه کشور)
-        «剩余流量：55.26 GB»        → GB   (یکای گیگابایت، نه بریتانیا)
-        «Speed: 20 mb/s NO limit»  → NO   (قیدِ نفی، نه نروژ)
+        "join-us-on-Telegram"      -> US   (`us` is an English word, not a country)
+        "剩余流量：55.26 GB"        -> GB   (gigabytes, not Great Britain)
+        "Speed: 20 mb/s NO limit"  -> NO   (negation, not Norway)
 
-    اندازه‌گیریِ دقتِ کلِ این روش روی ۶۷۵ کانفیگ با کشورِ واقعیِ مستقل
-    (ip-api.com): ۵۳٫۶٪ درست، ۱۴٫۷٪ **غلط**، ۳۱٫۷٪ تسلیم. برچسبِ غلط از نبودِ
-    برچسب زیان‌بارتر است، چون کاربر آن را باور می‌کند.
+    Accuracy measured over 675 configs with independent ground truth from
+    ip-api.com: 53.6% correct, 14.7% wrong, 31.7% gave up. A wrong label is worse
+    than none, because a user trusts it.
 
-    اکنون منبعِ اصلی، مکانِ واقعیِ شبکه است (geo.py). این تابع فقط وقتی به کار
-    می‌آید که پایگاهِ دادهٔ GeoIP در دسترس نباشد — یعنی حالتِ کاهش‌یافته. پس:
+    The main source is now the real network location (geo.py). This function is
+    only used in the degraded mode where the GeoIP database is unavailable, so:
 
-      • مرحلهٔ پرچمِ یونیکد نگه داشته شد: پرچم یک ادعای صریحِ ماشین‌خوان است.
-      • مرحلهٔ کلیدواژه نگه داشته شد ولی تنها با مرزِ واژه، تا «Vienna» دیگر
-        در «Viennam» یا نامِ کاربری گم نشود.
-      • حلقهٔ حدسِ دوحرفی **حذف شد**. هیچ برچسبی بهتر از برچسبِ اشتباه است.
+      - the Unicode flag stage stays: a flag is an explicit machine-readable claim
+      - the keyword stage stays, but only with word boundaries
+      - the two-letter guess loop is gone. No label is better than a wrong label.
 
-    چرا حتی نسخهٔ «محافظه‌کارِ» حدس هم برنگشت
-    ────────────────────────────────────────
-    این پرسش جدی گرفته شد و آزموده شد، نه رد. فرضیه: «شاید کدِ دوحرفی اگر فقط
-    در *ابتدای* ریمارک و پیش از یک جداکننده باشد، قابلِ اعتماد است.» سه راهبرد
-    روی ۴٬۲۹۱ ریمارکِ **واقعیِ منابعِ بالادست** (نه ریمارکِ برندشدهٔ خودمان،
-    که پرچم دارد و آزمون را بی‌معنا می‌کند) با مرجعِ مستقلِ ip-api سنجیده شد:
+    The obvious question, "what about a cautious guess, only at the start of the
+    remark?" was tested, not waved away. Over 4,291 *upstream* remarks (not our
+    branded output, which already carries flags):
 
-        الف) حدس در هر جای متن   درست ۳۹٫۵٪   غلط ۸٫۲٪   تسلیم ۵۲٫۳٪
-        ب ) بدونِ حدس (فعلی)     درست ۳۹٫۱٪   غلط ۶٫۰٪   تسلیم ۵۵٫۰٪
-        ج ) حدسِ فقط ابتدای متن  درست ۳۹٫۲٪   غلط ۶٫۳٪   تسلیم ۵۴٫۵٪
+        guess anywhere          39.5% correct, 8.2% wrong, 52.3% gave up
+        no guess (current)      39.1% correct, 6.0% wrong, 55.0% gave up
+        guess only at the start 39.2% correct, 6.3% wrong, 54.5% gave up
 
-    «ج» در برابرِ «ب» ‎+۰٫۱۶٪ درست می‌آورد ولی ‎+۰٫۳۳٪ غلط — یعنی به ازای هر
-    برچسبِ درستِ تازه، دو برچسبِ غلط. نمونهٔ واقعیِ شکستش: «AE_speednode_0001»
-    که کدِ ابتدای متنش AE است ولی سرور در فرانسه است، و «CN_speednode_0005»
-    که در آمریکا است. پس حدس، حتی مهارشده، سود نمی‌دهد و برنگشت.
+    The guarded guess buys +0.16% more correct labels and +0.33% more wrong ones,
+    i.e. two wrong labels for every fresh correct one. Real failures:
+    "AE_speednode_0001" whose server is in France, and "CN_speednode_0005" whose
+    server is in the US. So even the cautious guess is not worth it.
 
-    توجه: حذفِ حدس، «تسلیم» را از ۵۲٫۳٪ به ۵۵٫۰٪ می‌برد؛ این بهاست، نه باگ. در
-    حالتِ عادی GeoIP آن ۵۵٪ را پر می‌کند و تسلیم به ۰٪ می‌رسد.
+    Losing the guess raises the give-up rate from 52.3% to 55.0%. That is the
+    cost, not a bug. In normal operation GeoIP fills that 55% and the give-up rate
+    falls to 0.
     """
     if not remark:
         return ("Global", "🌐")
@@ -387,249 +324,265 @@ def detect_country_from_remark(remark: str) -> Tuple[str, str]:
         code = _flag_to_country_code(flag)
         if code:
             return (code, flag)
-    remark_lower = remark.lower()
+    lowered = remark.lower()
     for keyword, info in _SORTED_KEYWORDS:
-        # مرزِ واژه لازم است: بدونِ آن کلیدواژهٔ «us» داخلِ «trust» یا
-        # «status» هم می‌افتد. اندازه‌گیری نشان داد بیشترِ خطاهای مرحلهٔ
-        # کلیدواژه از همین جای‌گیریِ درونِ واژه می‌آمد.
-        if _keyword_hit(remark_lower, keyword):
+        # Word boundaries matter: without them, short keywords like `us` hit inside
+        # words such as "trust" or "status". Measurement showed most keyword-stage
+        # errors came from exactly that.
+        if _keyword_hit(lowered, keyword):
             return info
     return ("Global", "🌐")
 
 
 def _keyword_hit(haystack: str, needle: str) -> bool:
-    """
-    آیا کلیدواژه به‌صورتِ واژهٔ مستقل در متن آمده است؟
+    """Whether a keyword appears as an independent word in the text.
 
-    برای کلیدواژه‌های کوتاه (تا سه حرف) مرزِ واژه الزامی است، چون رشتهٔ کوتاه
-    به‌سادگی داخلِ واژه‌های بی‌ربط پیدا می‌شود. برای کلیدواژه‌های بلندتر مانند
-    «netherlands» جست‌وجوی ساده کافی و مطلوب است، چون در نام‌های مرکب مانند
-    «amsterdam-netherlands-01» هم باید پیدا شود.
+    Keywords up to three chars require word boundaries, because a short string
+    easily appears inside unrelated words. Longer ones like "netherlands" are
+    fine with a plain substring search, which also correctly finds
+    "amsterdam-netherlands-01".
     """
     if len(needle) > 3:
         return needle in haystack
-    i = haystack.find(needle)
-    while i != -1:
-        before = haystack[i - 1] if i > 0 else ""
-        after = haystack[i + len(needle)] if i + len(needle) < len(haystack) else ""
+    pos = haystack.find(needle)
+    while pos != -1:
+        before = haystack[pos - 1] if pos > 0 else ""
+        after = haystack[pos + len(needle)] if pos + len(needle) < len(haystack) else ""
         if not before.isalnum() and not after.isalnum():
             return True
-        i = haystack.find(needle, i + 1)
+        pos = haystack.find(needle, pos + 1)
     return False
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# پایداریِ برچسبِ کشور
+# Country label stability.
 #
-# چرا این بخش وجود دارد: برچسبِ کشور تا پیش از این فقط از متنِ ریمارکِ منبع
-# خوانده می‌شد. هر منبع برای یک سرورِ یکسان ریمارکِ متفاوتی می‌دهد، پس یک
-# کانفیگِ ثابت در اجرای اول «RU 🇷🇺» و در اجرای بعدی «US 🇺🇸» برچسب می‌خورد.
-# پیامدِ عملی: ۳۲۶۸ خط از ۳۵۳۷ خط در هر اجرا فقط به‌خاطرِ ریمارک تغییر می‌کرد
-# (بدنهٔ فنی دست‌نخورده)، پس هر انتشار تقریباً کل فایل را از نو می‌نوشت.
+# Country used to be read only from the source remark. Different sources label the
+# same server differently, so one stable config was "RU" in one run and "US" in
+# the next. Practical effect: 3,268 of 3,537 lines changed every run purely
+# because of the remark, so each publish rewrote almost the whole file.
 #
-# راهکار: برچسب به «مقصدِ اتصال» گره می‌خورد، نه به متنِ منبع. برای یک
-# host/IP یکسان همیشه یک برچسب تولید می‌شود، مستقل از این‌که کدام منبع آن را
-# آورده باشد. اگر هیچ منبعی کشور را نگوید، «Global 🌐» می‌ماند.
-# ──────────────────────────────────────────────────────────────────────────────
-
-_HOST_COUNTRY_CACHE: dict = {}
+# Fix: the label is keyed to the connection target, not to the source text. The
+# same host/IP therefore always gets one label, independent of which source it
+# came from. If no source can tell us the country, it stays "Global 🌐".
+_HOST_COUNTRY_CACHE: Dict[str, Tuple[str, str]] = {}
+_GEO_MODULE: Any = ...
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# دیکدِ base64 که به نسخهٔ مفسر وابسته نیست
-# ──────────────────────────────────────────────────────────────────────────────
-#
-# ⚠️ چرا این تابع وجود دارد — یک یافتهٔ اندازه‌گیری‌شده، نه احتیاطِ نظری.
-#
-# `base64.urlsafe_b64decode` روی ورودیِ حاویِ padding در **میانه** بین نسخه‌های
-# CPython رفتارِ متفاوت دارد. اندازه‌گیریِ مستقیم روی `urlsafe_b64decode(s + "==")`:
-#
-#     s = "QUJDRA==EFGH"       →  3.10 : b"ABCD"                 3.13 : b"ABCD\x01\x05\x18"
-#     s = "QUJDRA==@host:443"  →  3.10 : b"ABCD"                 3.13 : binascii.Error  ← پرتاب!
-#     s = "QUJDRQ=XYZ"         →  3.10 : binascii.Error          3.13 : binascii.Error
-#     s = "QUJD@RA=="          →  3.10 : b"ABCD"                 3.13 : b"ABCD"
-#
-# سه رفتارِ متفاوت، و یکی از آن‌ها استثنا می‌پرتابد. چون `dedup_key` استثنا را با
-# `except: pass` می‌بلعد، نتیجه یک **کلیدِ هویتِ متفاوت** است، بی‌هیچ صدایی.
-#
-# پیامدِ واقعی که سنجیده شد: دو کانفیگ از ۸٬۱۳۶ کانفیگِ منتشرشده برچسبی داشتند
-# که مفسرِ ۳.۱۳ بازتولید نمی‌کرد، در حالی که ۳.۱۰ و CI (۳.۱۲) هر دو همان برچسبِ
-# منتشرشده را می‌دادند (`3BA0F5`، `25CF83`). ورودی اثباتاً یکسان بود: sha256 فایلِ
-# نمونه و sha256 خودِ `userinfo` در دو محیط برابر بودند و تنها خروجیِ دیکد
-# ۷۴ بایت در برابر ۸۰ بایت شد.
-#
-# `dedup_key` تابعِ **هویتِ** این مخزن است: یکتاسازی، ترتیبِ خروجی، برچسبِ ریمارک،
-# و شمارشِ مالکیت در `unique_yield` (فاز D) همه به آن تکیه دارند. یک تابعِ هویت
-# نباید به نسخهٔ مفسر وابسته باشد.
-#
-# راهکار: به‌جای تقلیدِ رفتارِ نامستندِ یک نسخهٔ خاص، **صورتِ مسئله را حذف می‌کنیم**:
-# اگر ورودی نحواً base64 نیست، تظاهر به دیکد نمی‌کنیم و `None` برمی‌گردانیم. برای
-# ورودیِ تمیز (که ۹۹.۹۷٪ موارد است) نتیجه با همهٔ نسخه‌ها یکسان است — و این
-# اندازه‌گیری شد، نه فرض.
-#
-# 🚫 عمداً در `try_base64_decode` (دیکدِ **بدنهٔ منابع**) استفاده نمی‌شود. آن‌جا
-#    اندازه‌گیریِ زنده روی هر ۲۱ منبعِ واقعی (شاملِ ۴ منبعِ base64) نشان داد
-#    ۳.۱۰ و ۳.۱۳ **کاملاً یکسان**اند (۲۰٬۵۲۰ خط در هر دو، ۰ منبع با تفاوت)، و
-#    محافظِ چگالیِ ۲۰٪ هم آن مسیر را مقاوم می‌کند. اِعمالِ گیتِ نحوی آن‌جا
-#    می‌توانست منبعی را که امروز جزئاً دیکد می‌شود کاملاً رد کند — یعنی از دست
-#    دادنِ کانفیگ در ازای مشکلی که وجود ندارد.
+def _load_geo_module() -> Any:
+    """Best-effort geo import, cached.
 
-#: بدنهٔ base64 — هر دو گونهٔ استاندارد (`+/`) و urlsafe (`-_`) با padding اختیاری
-#: در **انتها**. وجودِ `=` در میانه یا هر کاراکترِ خارج از الفبا ⇒ ورودی base64 نیست.
+    country_for_endpoint() used to inline the nested relative-import / plain-import
+    fallback on every call. This helper keeps the behaviour identical and makes
+    the call-site readable.
+    """
+    global _GEO_MODULE
+    if _GEO_MODULE is not ...:
+        return _GEO_MODULE
+    try:
+        from . import geo as geo_module  # type: ignore
+    except Exception:
+        try:
+            import geo as geo_module  # type: ignore
+        except Exception:
+            geo_module = None  # type: ignore
+    _GEO_MODULE = geo_module
+    return _GEO_MODULE
+
+# Version-stable base64 decoding.
+#
+# Why it exists, measured not hypothetical:
+# `base64.urlsafe_b64decode` behaves differently across CPython versions on input
+# that contains padding in the *middle*.
+#
+#     s = "QUJDRA==EFGH"       -> 3.10: b"ABCD"                 3.13: b"ABCD\x01\x05\x18"
+#     s = "QUJDRA==@host:443"  -> 3.10: b"ABCD"                 3.13: binascii.Error
+#     s = "QUJDRQ=XYZ"         -> 3.10: binascii.Error          3.13: binascii.Error
+#     s = "QUJD@RA=="          -> 3.10: b"ABCD"                 3.13: b"ABCD"
+#
+# Three behaviours, one of them an exception. Because dedup_key() swallows errors
+# with `except: pass`, the result is a *different identity key* with no noise.
+#
+# Measured consequence: two of the 8,136 published configs had labels that Python
+# 3.13 could not reproduce, while 3.10 and CI (3.12) both did. The input was
+# proven identical by sha256 of the sample file and the userinfo fragment; only the
+# decoded output differed (74 vs 80 bytes).
+#
+# dedup_key() is the repo's identity function: deduping, output ordering, remark
+# tags, and unique_yield() in phase D all depend on it. An identity function must
+# not depend on the Python version.
+#
+# Fix: remove the problem itself. If the input is not syntactically base64, do not
+# pretend to decode it; return None. For clean input, 99.97% of cases, the result
+# is identical across versions, measured.
+#
+# Deliberately *not* used in try_base64_decode(), which handles whole source blobs.
+# On all 21 real sources, including 4 base64 sources, 3.10 and 3.13 produced
+# exactly the same output there (20,520 lines in both, 0 sources different), and
+# the 20% density guard already makes that path robust. A strict syntax gate there
+# could have fully rejected a source that currently decodes partly, losing configs
+# for a problem that does not exist.
 _B64_BODY_RE = re.compile(r"^[A-Za-z0-9+/_-]+={0,2}$")
 
 
 def decode_base64_text(candidate: str) -> Optional[str]:
-    """
-    اگر `candidate` **نحواً** base64 باشد متنِ دیکدشده را برمی‌گرداند، وگرنه None.
+    """Decoded text if `candidate` is syntactically base64, else None.
 
-    قطعی است: خروجی فقط تابعِ ورودی است، نه نسخهٔ CPython. جزئیاتِ چرایی در
-    کامنتِ بالای همین بخش.
+    Deterministic: the output is a function of the input, not of the CPython
+    version. Details in the note above.
     """
-    s = (candidate or "").strip()
-    if not s or not _B64_BODY_RE.match(s):
+    text = (candidate or "").strip()
+    if not text or not _B64_BODY_RE.match(text):
         return None
-    body = s.rstrip("=")
-    # طولِ ۴k+1 در base64 ممکن نیست؛ همهٔ نسخه‌ها این را خطا می‌دانند.
+    body = text.rstrip("=")
+    # length 4k+1 is impossible in base64; every version rejects it
     if len(body) % 4 == 1:
         return None
     body += "=" * ((4 - len(body) % 4) % 4)
     try:
-        # `urlsafe_b64decode` هر دو الفبا را می‌پوشاند: `-`/`_` را ترجمه می‌کند و
-        # `+`/`/` را دست‌نخورده رد می‌کند. پس یک فراخوانی کافی است.
         raw = base64.urlsafe_b64decode(body)
     except Exception:
         return None
     return raw.decode("utf-8", errors="ignore")
 
 
-def _ssr_b64_text(s: Optional[str], *, allow_empty: bool = False) -> Optional[str]:
-    """
-    base64 (هر دو الفبا، با یا بدونِ padding) → متنِ UTF-8، یا None.
+def _ssr_b64_text(value: Optional[str], *, allow_empty: bool = False) -> Optional[str]:
+    """base64, either alphabet, padded or not -> UTF-8 text, or None.
 
-    ⚠️ این تابع **آینهٔ مو‌به‌موی** `converters._ub64_text` است و باید بماند.
-    عمداً `decode_base64_text` بالایی را به کار نمی‌بریم و عمداً هم آن را
-    سهل‌گیر نمی‌کنیم: آن تابع کلیدِ **همهٔ** طرح‌ها را می‌سازد و شل‌کردنش
-    می‌توانست هزاران رکورد را جابه‌جا کند. این یکی دامنه‌اش تنها `ssr://` است.
+    This is an exact mirror of converters._ub64_text and must stay that way.
+    Deliberately does *not* call decode_base64_text above, and deliberately does
+    not soften it: that function builds identity keys for every scheme, and
+    loosening it could reshuffle thousands of records. This one only touches ssr.
 
-    دو تفاوتِ عمدی با `decode_base64_text`:
-      • `errors="ignore"` ندارد — بایتِ نامعتبر ⇒ None، نه رمزِ نیمه‌خورده.
-        دلیلش همان است که `converters` نوشته: گذرواژهٔ مثله‌شده کانفیگی
-        می‌سازد که «معتبر به‌نظر می‌رسد ولی هرگز وصل نمی‌شود».
-      • الگوی نحویِ `_B64_BODY_RE` را تحمیل نمی‌کند، چون مبدل هم نمی‌کند و
-        هر اختلافی این‌جا یعنی واگرایی از تجزیه‌کنندهٔ واقعیِ خروجی.
+    Two deliberate differences from decode_base64_text:
+      - no errors="ignore": invalid bytes -> None, not a half-eaten password.
+      - no _B64_BODY_RE syntax gate, because the converter does not have one
+        either. Any difference here means drifting from the real output parser.
     """
-    s = (s or "").strip()
-    if not s:
+    text = (value or "").strip()
+    if not text:
         return "" if allow_empty else None
-    s = s.replace("-", "+").replace("_", "/")
-    s += "=" * ((4 - len(s) % 4) % 4)
+    text = text.replace("-", "+").replace("_", "/")
+    text += "=" * ((4 - len(text) % 4) % 4)
     try:
-        return base64.b64decode(s, validate=False).decode("utf-8")
+        return base64.b64decode(text, validate=False).decode("utf-8")
     except Exception:
         return None
 
 
 def _ssr_parts(line: str) -> Optional[Tuple[str, str, str, str, str, str, str, str]]:
-    """
-    اجزای هویتیِ یک `ssr://`، یا None اگر تجزیه‌شدنی نبود.
+    """Identity parts of an ssr:// config, or None if it does not parse.
 
-    گرامر عیناً از `converters.parse_proxy` شاخهٔ `ssr` برداشته شده:
+    The grammar is copied *exactly* from converters.parse_proxy's ssr branch:
 
-        ssr://base64( host:port:protocol:method:obfs:base64(password)
-                      /?obfsparam=b64&protoparam=b64&remarks=b64&group=b64 )
+        ssr://base64(host:port:protocol:method:obfs:base64(password)
+                     /?obfsparam=b64&protoparam=b64&remarks=b64&group=b64)
 
-    چهار قاعدهٔ ریزِ آن‌جا که این‌جا هم عیناً رعایت می‌شود، وگرنه دو
-    تجزیه‌کنندهٔ واگرا می‌سازیم (درسِ K-L6):
-      ۱. برشِ `#` **پیش از** رمزگشایی — نویسهٔ `#` در هیچ الفبای base64 نیست.
-      ۲. `partition("/?")` برای جدا کردنِ query.
-      ۳. **شش** بخشِ الزامی؛ کم یا زیاد ⇒ رد. این IPv6 را هم رد می‌کند، عیناً
-         مثلِ مبدل (مشخصهٔ ssr هیچ فرمِ IPv6 تعریف نکرده).
-      ۴. میزبانِ ناتهی و پورتِ عددی.
+    Four small rules from there are mirrored here, or we build two parsers that
+    drift, which this project has already paid for once:
+      1. split off `#` *before* decoding, because `#` is in neither base64 alphabet
+      2. use partition("/?") to split query from body
+      3. require exactly six sections, rejecting IPv6 too because the ssr spec has
+         no IPv6 form either
+      4. require a non-empty host and a numeric port
 
-    خروجی: (host, port, protocol, method, obfs, password, obfsparam, protoparam)
-    همه رمزگشایی‌شده و **خام** — یعنی از `_sanitize_ssr` نگذشته. عمدی است:
-    پاک‌سازی چند مقدارِ متفاوت را روی یک مقدار می‌نشاند و کلیدسازی روی آن
-    می‌توانست دو کانفیگِ متمایز را ادغام کند. قاعدهٔ مستندِ مخزن «در تردید،
-    ادغام نکن» است، پس مقادیرِ خام = جهتِ تفکیک‌گرا = ایمن.
+    Output is (host, port, protocol, method, obfs, password, obfsparam,
+    protoparam), all decoded and *raw*, i.e. before _sanitize_ssr. Deliberate:
+    sanitising maps several different values onto one value, and building the key
+    on that could merge two distinct configs. The project rule is "when in doubt,
+    do not merge", so raw values are the safe, splitting direction.
 
-    این مجموعه دقیقاً همان چیزی است که مبدل به خروجی امیت می‌کند
-    (`server, port, cipher, password, obfs, protocol, obfs_param,
-    protocol_param`) منهای `name` — که برند بازنویسی‌اش می‌کند و هویت نمی‌سازد.
-    `remarks` و `group` هم هرگز به خروجی نمی‌رسند، پس در کلید وزن نمی‌گیرند.
+    This is exactly what the converter emits (`server, port, cipher, password,
+    obfs, protocol, obfs_param, protocol_param`) minus `name`, which branding
+    rewrites and therefore does not define identity. `remarks` and `group` never
+    reach output either, so they get no weight in the key.
     """
     if not line.startswith("ssr://"):
         return None
     body = line[len("ssr://"):].split("#", 1)[0].strip()
-    txt = _ssr_b64_text(body)
-    if not txt:
+    text = _ssr_b64_text(body)
+    if not text:
         return None
-    main, _sep, qs = txt.partition("/?")
+    main, _sep, query = text.partition("/?")
     parts = main.split(":")
     if len(parts) != 6:
         return None
-    host, port_s, proto, method, obfs, pwd_b64 = parts
-    if not host or not port_s.isdigit():
+    host, port_text, protocol, method, obfs, password_b64 = parts
+    if not host or not port_text.isdigit():
         return None
-    pwd = _ssr_b64_text(pwd_b64, allow_empty=True)
-    if pwd is None:
+    password = _ssr_b64_text(password_b64, allow_empty=True)
+    if password is None:
         return None
-    sq = urllib.parse.parse_qs(qs)
-    obfsparam = _ssr_b64_text(
-        (sq.get("obfsparam") or [""])[0], allow_empty=True) or ""
-    protoparam = _ssr_b64_text(
-        (sq.get("protoparam") or [""])[0], allow_empty=True) or ""
-    return (host, port_s, proto, method, obfs, pwd, obfsparam, protoparam)
+    parsed_qs = urllib.parse.parse_qs(query)
+    obfsparam = _ssr_b64_text((parsed_qs.get("obfsparam") or [""])[0],
+                              allow_empty=True) or ""
+    protoparam = _ssr_b64_text((parsed_qs.get("protoparam") or [""])[0],
+                               allow_empty=True) or ""
+    return (host, port_text, protocol, method, obfs, password,
+            obfsparam, protoparam)
+
+
+def _vmess_json(line: str) -> Optional[dict]:
+    """Decoded vmess JSON object, or None when this vmess line is not JSON-backed."""
+    if not line.startswith("vmess://"):
+        return None
+    body = line[8:].split("#")[0].strip()
+    text = decode_base64_text(body)
+    if text is None:
+        return None
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _vmess_remark_source(line: str) -> Optional[Tuple[dict, str]]:
+    """vmess JSON plus the old visible remark, if this is a JSON-backed vmess line."""
+    obj = _vmess_json(line)
+    if obj is None:
+        return None
+    return obj, str(obj.get("ps") or obj.get("name") or "")
 
 
 def endpoint_of(line: str) -> str:
-    """آدرسِ مقصدِ کانفیگ (host یا IP) بدونِ پورت. برای vmess از JSON خوانده می‌شود."""
+    """Connection target, host or IP without the port.
+
+    vmess usually carries base64+JSON, but not always; some sources publish vmess
+    in the standard URI form, just like vless:
+
+      vmess://<uuid>@91.107.139.186:51459?encryption=auto&type=tcp#…
+
+    On such lines, the old JSON path fell through to "unknown". That did more
+    than lose a label: because brand_remark() does nothing without a target, the
+    upstream remark shipped untouched and with it a rival channel advert
+    (measured, 1 line out of 8,018). So vmess only takes the JSON path when it is
+    *actually* JSON; otherwise it falls through to the generic URI parser below
+    and gets the correct host there.
+
+    ssr is different again: the whole body is base64, so the generic URI parser
+    below saw only that base64 string as the host. Measured: all 112 ssr lines had
+    a nonsense endpoint, so GeoIP always failed and every one became Global 🌐.
+    Decoding fixes 96 of those 112.
+    """
     line = (line or "").strip()
     if not line:
         return ""
     try:
-        if line.startswith("vmess://"):
-            # اکثرِ vmessها بدنهٔ base64+JSON دارند، ولی *نه همه‌شان*. بعضی منابع
-            # vmess را در قالبِ استانداردِ URI می‌دهند، دقیقاً مثلِ vless:
-            #
-            #   vmess://<uuid>@91.107.139.186:51459?encryption=auto&type=tcp#…
-            #
-            # پیش از این، شکستِ JSON این‌جا به `return ""` می‌رسید و مقصد «نامعلوم»
-            # می‌شد. پیامدِ واقعی‌اش فقط یک برچسبِ ازدست‌رفته نبود: چون
-            # `brand_remark` بی‌مقصد کاری نمی‌کند، ریمارکِ بالادست دست‌نخورده
-            # منتشر می‌شد و تبلیغِ کانالِ رقیب («📯1@oneclickvpnkeys») در خروجیِ
-            # ما می‌نشست. شمارشِ زنده در همین اجرا: ۱ مورد از ۸٬۰۱۸.
-            #
-            # پس در صورتِ شکست، به تجزیهٔ عمومیِ URI پایین می‌افتیم و همان‌جا
-            # میزبان درست به‌دست می‌آید.
-            b64 = line[8:].split("#")[0].strip()
-            _txt = decode_base64_text(b64)
-            try:
-                obj = json.loads(_txt) if _txt is not None else None
-            except Exception:
-                obj = None
-            if isinstance(obj, dict):
-                host = str(obj.get("add") or obj.get("host") or "").strip().lower()
-                if host:
-                    return host
-            # نه JSON بود و نه میزبانی داشت → ادامه با مسیرِ عمومی
+        vmess = _vmess_json(line)
+        if vmess is not None:
+            host = str(vmess.get("add") or vmess.get("host") or "").strip().lower()
+            if host:
+                return host
         if line.startswith("ssr://"):
-            # ssr **کلِ** بدنه را base64 می‌کند، پس تجزیهٔ عمومیِ URI پایین
-            # روی متنِ رمزشده کار می‌کرد و یک رشتهٔ base64 را به‌جای میزبان
-            # برمی‌گرداند. پیامدِ اندازه‌گیری‌شده: هر ۱۱۲ خطِ ssr مقصدِ بی‌معنا
-            # داشتند ⇒ GeoIP همیشه شکست ⇒ برچسبِ «Global 🌐» برای همه.
-            # با رمزگشایی، ۹۶ خط از ۱۱۲ برچسبِ کشورِ واقعی می‌گیرند.
-            _p = _ssr_parts(line)
-            if _p:
-                return _p[0].strip().lower()
-            # تجزیه‌نشدنی → مثلِ قبل به مسیرِ عمومی می‌افتد (رفتارِ پیشین حفظ می‌شود)
-        # سایر پروتکل‌ها: scheme://[userinfo@]host[:port][?query][#fragment]
+            parts = _ssr_parts(line)
+            if parts:
+                return parts[0].strip().lower()
+        # All other schemes: scheme://[userinfo@]host[:port][?query][#fragment]
         rest = line.split("://", 1)[1] if "://" in line else line
         rest = rest.split("#", 1)[0].split("?", 1)[0]
         if "@" in rest:
             rest = rest.rsplit("@", 1)[1]
         rest = rest.split("/", 1)[0]
-        if rest.startswith("["):                      # IPv6 literal
+        if rest.startswith("["):  # IPv6 literal
             return rest.split("]", 1)[0][1:].lower()
         return rest.rsplit(":", 1)[0].lower() if ":" in rest else rest.lower()
     except Exception:
@@ -637,86 +590,72 @@ def endpoint_of(line: str) -> str:
 
 
 def country_for_endpoint(endpoint: str, remark_hint: str = "") -> Tuple[str, str]:
+    """Stable country label for a target, by this priority:
+
+        1. GeoIP on the real network address   most trustworthy, measured 97.9% correct
+        2. a Unicode flag in the remark        degraded mode only
+        3. a country keyword in the remark     degraded mode only
+        4. Global 🌐                           honest admission of not knowing
+
+    GeoIP outranks the source flag because the source flag is hand-written by the
+    source author, and measurement showed 14.7% of labels derived from remarks do
+    not match the server's real country. The actual network location is measurable;
+    the remark is not. Wrong upstream flags are therefore overwritten.
+
+    Stability: a label is computed once per target and cached. If ten sources bring
+    the same server with ten different remarks, they all get one label and the
+    output stops drifting between runs.
     """
-    برچسبِ پایدارِ کشور برای یک مقصد، با ترتیبِ اولویتِ زیر:
-
-        ۱. GeoIP روی نشانیِ واقعیِ شبکه   ← معتبرترین، اندازه‌گیری‌شده ۹۷٫۹٪ درست
-        ۲. پرچمِ یونیکدِ داخلِ ریمارک       ← ادعای صریحِ منبع (حالتِ کاهش‌یافته)
-        ۳. کلیدواژهٔ نامِ کشور در ریمارک    ← حالتِ کاهش‌یافته
-        ۴. «Global 🌐»                     ← اعترافِ صادقانه به ندانستن
-
-    چرا GeoIP بالاتر از پرچمِ منبع است: پرچمِ ریمارک را نویسندهٔ منبع می‌نویسد و
-    اندازه‌گیری نشان داد که ۱۴٫۷٪ از برچسب‌های حاصل از ریمارک با کشورِ واقعیِ
-    سرور نمی‌خواند. مکانِ واقعیِ شبکه قابلِ اندازه‌گیری است؛ متنِ ریمارک نه.
-    برای همین، پرچمِ نادرستِ بالادست بازنویسی می‌شود.
-
-    پایداری: نتیجه برای هر مقصد یک بار محاسبه و در حافظه قفل می‌شود، پس اگر
-    ده منبعِ مختلف یک سرور را با ده ریمارکِ متفاوت بیاورند، همه یک برچسب
-    می‌گیرند و خروجی بینِ اجراها ثابت می‌ماند.
-    """
-    ep = (endpoint or "").strip().lower()
-    if not ep:
+    endpoint = (endpoint or "").strip().lower()
+    if not endpoint:
         return detect_country_from_remark(remark_hint)
-    cached = _HOST_COUNTRY_CACHE.get(ep)
+    cached = _HOST_COUNTRY_CACHE.get(endpoint)
     if cached is not None:
         return cached
 
-    # ۱) مکانِ واقعیِ شبکه. اگر پایگاهِ دادهٔ GeoIP نبود، geo ماژول None
-    #    برمی‌گرداند و به مرحلهٔ بعد می‌رویم؛ نبودِ آن هرگز خطا نمی‌دهد.
-    try:
-        from . import geo  # type: ignore
-    except Exception:
-        try:
-            import geo  # type: ignore
-        except Exception:
-            geo = None  # type: ignore
+    # 1) The real network location. If the GeoIP database is missing, geo returns
+    # None and we fall through; its absence never raises here.
+    geo = _load_geo_module()
     if geo is not None:
         try:
-            hit = geo.country_for_host(ep)
+            hit = geo.country_for_host(endpoint)
         except Exception:
             hit = None
         if hit:
-            _HOST_COUNTRY_CACHE[ep] = hit
+            _HOST_COUNTRY_CACHE[endpoint] = hit
             return hit
 
-    # ۲و۳) حالتِ کاهش‌یافته: خواندنِ ریمارک
+    # 2 and 3) degraded mode: read the remark
     info = detect_country_from_remark(remark_hint)
-    # فقط نتیجهٔ قاطع را قفل می‌کنیم؛ «Global» یعنی هنوز نمی‌دانیم، پس اگر
-    # منبعِ بعدی کشور را گفت اجازهٔ ارتقا می‌دهیم.
+    # Cache only definitive labels. "Global" means we still do not know, so let a
+    # later source upgrade it.
     if info[0] != "Global":
-        _HOST_COUNTRY_CACHE[ep] = info
+        _HOST_COUNTRY_CACHE[endpoint] = info
     return info
 
 
 def reset_country_cache() -> None:
-    """پاک‌سازیِ حافظهٔ برچسب‌ها (برای تست‌های مستقل)."""
+    """Clear the country-label cache, for isolated tests."""
     _HOST_COUNTRY_CACHE.clear()
 
 
 def stable_label(line: str) -> str:
-    """
-    شناسهٔ پایدارِ کانفیگ برای انتهای ریمارک.
+    """Stable per-config suffix for the remark.
 
-    پیش از این شماره از موقعیتِ خط می‌آمد (enumerate)، پس افزودن یا حذفِ یک
-    کانفیگ، شمارهٔ همهٔ خطوطِ بعدی را جابه‌جا می‌کرد و باعثِ تغییرِ سراسریِ فایل
-    می‌شد. اکنون شناسه از خودِ محتوای کانفیگ مشتق می‌شود، پس تا وقتی کانفیگ
-    عوض نشود شناسه‌اش هم عوض نمی‌شود.
+    This used to come from the line number, so inserting or deleting one config
+    shifted every later line's label and rewrote the whole file. It now derives
+    from the config content, so the label changes only when the config itself does.
     """
     key = dedup_key(line) or (line or "").strip()
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:6].upper()
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# dedup key (vendored از freeconfigs._dedup_key)
-# ──────────────────────────────────────────────────────────────────────────────
-
+# dedup_key(), vendored from freeconfigs._dedup_key.
 _IDENTITY_PARAMS = frozenset({
     "security", "sni", "pbk", "sid", "host", "path", "servicename",
     "flow", "type", "headertype", "encryption", "mode",
-    # ★ فاز J / J-7a: `alpn` و `extra` اثباتاً بر «رسیدن» مؤثرند — نقشهٔ
-    # وابستگیِ اندازه‌گیری‌شده نشان داد `alpn` به فیلدِ `alpn` و `extra` به
-    # فیلدِ `extra` امیت می‌شوند. بی این دو، «alpn=h3» و «بی‌alpn» یک کلید
-    # می‌گرفتند و یکی خاموش به `r.duplicates` می‌رفت (= حذفِ خاموش).
+    # alpn and extra provably affect reachability: the measured dependency map
+    # showed alpn is emitted to alpn and extra to extra. Without them,
+    # "alpn=h3" and "no alpn" got one key and one died silently as a duplicate.
     "alpn", "extra",
     "obfs", "obfs-password", "obfspassword",
     "congestion_control", "congestion",
@@ -724,131 +663,115 @@ _IDENTITY_PARAMS = frozenset({
 })
 
 
-def _norm_type(t: str) -> str:
-    t = (t or "").strip().lower()
-    return "tcp" if t in ("", "raw", "none", "tcp") else t
+def _norm_type(value: str) -> str:
+    value = (value or "").strip().lower()
+    return "tcp" if value in ("", "raw", "none", "tcp") else value
 
-
-#: پروتکل‌هایی که `insecure` را واقعاً امیت می‌کنند: `converters.py:896`/`:915`
-#: (`skip-cert-verify` در clash) و `converters.py:1179`/`:1193`
-#: (`tls.insecure` در sing-box). vless/trojan هیچ‌کدام را نمی‌نویسند.
+#: Schemes that really emit `insecure`: hysteria2/tuic. vless/trojan emit neither
+#: skip-cert-verify nor tls.insecure.
 _INSECURE_SCHEMES = frozenset({"hysteria2", "hy2", "tuic"})
 
-#: نگارشِ **حرف‌به‌حرفِ** کلیدهایی که `converters.py:691-692` و `:727`
-#: می‌خوانند. عمداً کوچک نمی‌شوند: اگر منبع `allowinsecure` تمام‌کوچک بنویسد،
-#: مبدّل آن را **نمی‌بیند** پس به خروجی نمی‌رسد و نباید در کلید وزن بگیرد.
+#: Literal spellings the converter actually reads. Intentionally not lowercased:
+#: if a source writes `allowinsecure` all-lowercase, the converter does *not* see
+#: it, so it must not influence the identity key either.
 _INSECURE_KEYS = ("insecure", "allowInsecure", "allow_insecure")
 
-#: عیناً `converters.py:507` (`_truthy`).
+#: Exactly converters.py:_truthy.
 _TRUTHY_VALUES = frozenset({"1", "true", "yes", "on"})
 
 
 def _insecure_flag(raw_params: dict) -> str:
-    """«۱» یا «۰» — دقیقاً همان چیزی که مبدّل از این خط برداشت می‌کند."""
-    for k in _INSECURE_KEYS:
-        v = raw_params.get(k)
-        if v:
-            return "1" if str(v[0] or "").strip().lower() in _TRUTHY_VALUES else "0"
+    """"1" or "0", exactly what the converter will read from the line."""
+    for key in _INSECURE_KEYS:
+        values = raw_params.get(key)
+        if values:
+            return "1" if str(values[0] or "").strip().lower() in _TRUTHY_VALUES else "0"
     return "0"
 
 
 _FRONT_HOST_BAD_CHARS = frozenset(' \t\r\n/:@?#{}"\\,;|<>()[]')
 
 
-def _is_plausible_fronting_host(v: str) -> bool:
-    """آیا `v` می‌تواند واقعاً یک دامنهٔ fronting باشد؟ — **فقط نحوی، بدونِ DNS**.
+def _is_plausible_fronting_host(value: str) -> bool:
+    """Can this value really be a fronting domain? Syntax only, no DNS.
 
-    چرا لازم است — ★ این دلیل در فازِ I **به‌روز شد**: پیش از فازِ I، وجودِ
-    `sni`/`host` باعث می‌شد کلید میزبانِ واقعی را دور بریزد (`host_for_key = ""`)
-    و هویت را به همان مقدار بسپارد؛ آن‌وقت یک مقدارِ زباله‌ی مشترک دو سرورِ
-    متفاوت را یکی می‌کرد و یکی‌شان در `aggregate.py` به `duplicates` می‌رفت و
-    **منتشر نمی‌شد**. اکنون میزبانِ واقعی **همیشه** در کلید می‌ماند، پس آن
-    مسیرِ ادغام بسته شده است؛ ولی این اعتبارسنجی همچنان لازم است، برای جهتِ
-    **عکس**: اگر مقدارِ زباله در `ep` بنشیند، دو خطِ یکسان که یکی‌شان آن زباله
-    را دارد و دیگری ندارد به دو کلید می‌شکنند و **دو بار منتشر** می‌شوند
-    (در فازِ H سنجیده شد: ۳۶ افراز). نمونه‌های واقعیِ سنجیده‌شده در پیکرهٔ زنده:
+    Why it still matters after phase I: before phase I, having sni/host made the
+    key throw away the real server host and hand identity to that fronting value.
+    A shared garbage value then merged two different servers and one died in
+    aggregate.py as a duplicate. Today the real server host always stays in the
+    key, so that merge path is closed; the validator still matters for the *other*
+    direction: if garbage survives into `ep`, two otherwise identical lines, one
+    with that garbage and one without, split into two keys and publish twice.
+    Measured, 36 false splits behaved exactly that way.
 
-        sni=https%3A%2F%2Ft.me%2Foneclickvpnkeys → «https://t.me/oneclickvpnkeys»
-        sni=t.me%2Fripaojiedian                  → «t.me/ripaojiedian»
-        sni=rd.autos.yahoo.com:40069             → پورت داخلِ نامِ میزبان
-        host=d2e1v87ko56lyw.cloudfront.net:assets.opensignal.com
-        host={"host":"..."}                      → بلوکِ JSON
-        host=/?bia_telegram@marambashi_...       → مسیر و پارامتر
-        host=v2raynplus--v2raynplus--v2raynplus  → تک‌برچسبی، نامِ کانال
-
-    قاعده‌ها و دلیلِ هرکدام:
-      • بدونِ DNS و بدونِ فهرستِ TLD — این تابع روی **هر خط** صدا زده می‌شود، پس
-        باید خالص و ارزان بماند. (پس مثلاً `fuck.rkn` که TLDش در IANA نیست
-        **گرفته نمی‌شود** — آگاهانه بیرون از دامنه است.)
-      • حداقل یک نقطه لازم است: یک دامنهٔ frontingِ عمومی همیشه FQDN است.
-        اندازه‌گیری: پذیرشِ مقادیرِ تک‌برچسبی باعث می‌شد ۱۲ افراز، **یک** نقطهٔ
-        پایانیِ واقعی را به دو کلید ببرند.
-      • یک نقطهٔ پایانی (FQDNِ ریشه‌لنگر، مثلِ `example.com.`) قانونی است و
-        نباید رد شود؛ در نسخهٔ اولِ ابزارِ سنجشم همین مورد ۴ مثبتِ کاذب ساخت.
+    Rules and why:
+      - no DNS and no TLD list: this runs on every line, so it must stay pure and
+        cheap. A host like `fuck.rkn`, whose TLD is not in IANA, is intentionally
+        not caught.
+      - at least one dot. A public fronting domain is always an FQDN. Allowing a
+        single-label value caused 12 false splits, i.e. one real endpoint broken
+        into two keys.
+      - one trailing dot is allowed. The first version of the measuring tool got
+        this wrong and produced four false positives.
     """
-    if not v or len(v) > 253:
+    if not value or len(value) > 253:
         return False
-    if v.startswith("[") and v.endswith("]") and len(v) > 2:
-        return True                              # لیترالِ IPv6
-    for ch in v:
+    if value.startswith("[") and value.endswith("]") and len(value) > 2:
+        return True  # IPv6 literal
+    for ch in value:
         if ch in _FRONT_HOST_BAD_CHARS:
             return False
-    if v.endswith("."):
-        v = v[:-1]
-    if not v or ".." in v or "." not in v:
+    if value.endswith("."):
+        value = value[:-1]
+    if not value or ".." in value or "." not in value:
         return False
-    for lab in v.split("."):
-        if not lab or len(lab) > 63:
+    for label in value.split("."):
+        if not label or len(label) > 63:
             return False
-        if lab[0] == "-" or lab[-1] == "-":
+        if label[0] == "-" or label[-1] == "-":
             return False
-        for ch in lab:
+        for ch in label:
             if not (ch.isascii() and (ch.isalnum() or ch == "-")):
                 return False
     return True
 
 
 def _sni_is_endpoint(security: str) -> bool:
-    """آیا `sni` را می‌توان «نقطهٔ پایانیِ واقعیِ» سرور شمرد؟
+    """Whether `sni` can count as the server's real endpoint.
 
-    فقط برای TLSِ معمولی. دو واقعیتِ **مستندِ** پروتکلی:
+    Only for normal TLS. Two protocol facts:
 
-      ۱. SNI یک **افزونهٔ TLS** است. اگر `security` برابرِ none/غایب باشد هیچ
-         دست‌تکانیِ TLS رخ نمی‌دهد، پس کلاینت هرگز SNI نمی‌فرستد و آن پارامتر
-         **بی‌اثر** است؛ نمی‌تواند سازوکارِ رسیدن به یک backendِ متمایز باشد.
+      1. SNI is a TLS extension. If security is none or absent, no TLS handshake
+         happens, so the client never sends SNI and that parameter is inert; it
+         cannot define a distinct backend.
 
-      ۲. در **REALITY**، مقدارِ `serverName` عمداً دامنهٔ یک **سایتِ ثالث** است
-         که گواهی‌اش قرض گرفته می‌شود، نه میزبانِ خودِ سرور. مستنداتِ رسمیِ
-         XTLS (xtls.github.io/en/config/transports/reality.html):
-           «REALITY … uses the appearance and handshake characteristics of a
-            **target site** as camouflage.»
-           `serverNames`: «Usually this should stay consistent with `target`.»
-           «best practice … is still to **borrow certificates from the same
-            ASN**.»
-         پس دو سرورِ کاملاً متفاوت که یک دامنهٔ استتارِ مشترک قرض می‌گیرند،
-         پیش از این **یک هویت** شمرده می‌شدند و یکی‌شان حذف می‌شد.
+      2. In REALITY, serverName is intentionally a *third-party* site's domain
+         whose certificate is being borrowed, not the server's own hostname. The
+         official XTLS docs say REALITY uses the appearance and handshake of a
+         target site as camouflage, and serverNames should usually stay consistent
+         with target. So two totally different servers borrowing the same camouflage
+         domain used to get one identity and one was dropped.
 
-    اندازه‌گیریِ واقعی روی پیکرهٔ زنده (۱۸٬۷۳۵ خط): کلیدهایی که ≥۲ نقطهٔ پایانیِ
-    **واقعیِ متفاوت** را در خود جمع کرده بودند از **۶۴۱ به ۵۰۰** رسید، و
-    ادغامِ کاذبِ **تازه‌ساخته‌شده = ۰**.
+    Measured over the live 18,735-line corpus, keys that grouped two or more
+    different *real* endpoints fell from 641 to 500, and false merges newly
+    introduced = 0.
 
-    ⚠️ پارامترِ `host` عمداً از این قاعده مستثناست: هدرِ HTTP `Host` سازوکارِ
-    دیگری است و در `type=ws` حتی بدونِ TLS هم مسیریابی می‌کند.
+    host is intentionally exempt from this rule: the HTTP Host header is a
+    different mechanism and in type=ws it routes even without TLS.
     """
     return security == "tls"
 
 
-def _norm_aid(v) -> str:
-    """`alterId` را همان‌گونه نرمال می‌کند که خودِ محصول می‌کند.
+def _norm_aid(value: Any) -> str:
+    """Normalise alterId exactly the way the product does.
 
-    ★ چرا لازم است: `converters.parse_proxy` مقدار را با
-    `_safe_int(obj.get("aid"), 0)` می‌خواند، پس `aid` غایب و `aid=0` و
-    `aid=""` هر سه خروجیِ **مو‌به‌مو یکسان** می‌دهند. اگر کلید
-    رشتهٔ خام را بنویسد، همان کانفیگ دو کلید می‌گیرد و دو بار
-    منتشر می‌شود — زیانِ (ب)، که اینجا به‌راحتی اجتناب‌پذیر است.
+    converters.parse_proxy reads it with `_safe_int(obj.get("aid"), 0)`, so a
+    missing aid, aid=0 and aid="" all produce *identical* output. If the key kept
+    the raw string, the same config would get two keys and publish twice. That is
+    the cheap, avoidable duplicate direction, so it is normalised.
     """
     try:
-        return str(int(str(v).strip() or "0"))
+        return str(int(str(value).strip() or "0"))
     except Exception:
         return "0"
 
@@ -859,150 +782,125 @@ _CASE_SENSITIVE_PARAMS = frozenset({
 })
 
 
-def _norm_identity_value(key: str, val: str) -> str:
-    # ★ فاز J / J-7e: کوچک‌سازیِ فراگیر دو مسیرِ متمایز را خاموش یکی
-    # می‌کرد (در پیکره: `path=TG%40ZDYZ2` و `path=tg%40zdyz2`)، در حالی
-    # که محصول مسیر را عیناً امیت می‌کند و مسیرِ HTTP به بزرگی/کوچکی
-    # حساس است. دربارهٔ `pbk`/`publickey` بدتر است: base64url است و
-    # کوچک‌سازی کلیدِ عمومیِ دیگری می‌سازد.
+def _norm_identity_value(key: str, value: str) -> str:
+    # Lowercasing everything used to silently merge distinct HTTP paths such as
+    # `path=TG%40ZDYZ2` and `path=tg%40zdyz2`, while the product emits the path
+    # byte for byte and HTTP paths are case sensitive. It is worse for public keys:
+    # lowercasing base64url yields a *different* key.
     if key in _CASE_SENSITIVE_PARAMS:
-        return (val or "").strip()
-    v = (val or "").strip().lower()
+        return (value or "").strip()
+    out = (value or "").strip().lower()
     if key in ("sni", "host"):
         for _ in range(2):
-            nv = urllib.parse.unquote(v)
-            if nv == v:
+            decoded = urllib.parse.unquote(out)
+            if decoded == out:
                 break
-            v = nv
-        v = v.strip().lower()
+            out = decoded
+        out = out.strip().lower()
     if key == "type":
-        # ★ رفعِ نامتقارنی: `_norm_type` برای ("", "raw", "none", "tcp") مقدارِ
-        # "tcp" برمی‌گرداند و حلقهٔ شاخهٔ عمومی آن را با شرطِ `nv != ""` نگه
-        # می‌دارد — اما `type`ِ **غایب** هرگز وارد `meaningful` نمی‌شود. پس
-        # `?type=tcp` و `?` (بی‌type) دو کلیدِ متفاوت می‌ساختند برای یک سرور.
-        # با بازگرداندنِ "" برای مقدارِ پیش‌فرض، این دو یکی می‌شوند.
-        # `_norm_type` عامداً دست‌نخورده می‌ماند: شاخهٔ vmess مقدارِ `net` را
-        # **موضعی** می‌نویسد و در آنجا "" باید همان "tcp" بماند.
-        nt = _norm_type(v)
-        return "" if nt == "tcp" else nt
+        # `_norm_type` returns "tcp" for the default forms. The general branch then
+        # keeps that value because `nv != ""`, while an actually *missing* `type`
+        # never enters `meaningful`. So `?type=tcp` and `?` produced different keys
+        # for one server. Returning "" for the default collapses those two, while
+        # leaving _norm_type untouched because the vmess branch uses it differently.
+        normalised = _norm_type(out)
+        return "" if normalised == "tcp" else normalised
     if key == "encryption":
-        return "" if v in ("", "none") else v
+        return "" if out in ("", "none") else out
     if key == "security":
-        return "" if v in ("", "none") else v
+        return "" if out in ("", "none") else out
     if key == "headertype":
-        return "" if v in ("", "none") else v
+        return "" if out in ("", "none") else out
     if key == "flow":
-        return "" if v == "" else v
-    return v
+        return "" if out == "" else out
+    return out
+
+
+def _vmess_identity(obj: dict, line: str) -> str:
+    """The identity key for a JSON-backed vmess line.
+
+    The logic here is intentionally dense because this is the repo's identity
+    function: deduping, output order, remark labels and unique-yield all lean on
+    it. The algorithm itself is left intact; only the comments were compressed and
+    the helper extracted so dedup_key() is readable again.
+    """
+    add = str(obj.get("add") or "").strip().lower()
+    host = _norm_identity_value("host", str(obj.get("host") or ""))
+    sni = _norm_identity_value("sni", str(obj.get("sni") or ""))
+    tls = (str(obj.get("tls") or "")).strip().lower()
+    # Anything the converter does not itself treat as TLS is identical to no TLS.
+    # See converters.parse_proxy (`in ("tls", "reality")`) and pipeline's
+    # FS_TLS_VALUES. So auto/none/""/junk all produce identical output. `xtls` is
+    # deliberately kept only so the rule can split, never merge, a future case.
+    tls = tls if tls in ("tls", "reality", "xtls") else ""
+    net = _norm_type(str(obj.get("net") or ""))
+    path = str(obj.get("path") or "")
+    # Only the proven equivalence is kept: "" == "/". rstrip("/") used to merge
+    # `/abc/` and `/abc`, which are distinct HTTP paths.
+    path = "/" if path == "" else path
+
+    # fronting-domain validation.
+    # Two distinct rejection modes, with different consequences:
+    #   (1) the value is not even a valid hostname -> garbage, carries no identity,
+    #       so it leaves `meaningful` entirely. If it merely stayed in the query it
+    #       would split identity on garbage; measured, 36 false splits were exactly
+    #       one real endpoint broken into multiple keys by `host=/?bia_telegram...`.
+    #   (2) the value is valid but this TLS/REALITY rule does not count it as an
+    #       endpoint -> it is still a real config parameter and stays in the query,
+    #       preserving today's distinctions without introducing new false splits.
+    if host and not _is_plausible_fronting_host(host):
+        host = ""
+    if sni and not (_is_plausible_fronting_host(sni) and _sni_is_endpoint(tls)):
+        sni = ""
+
+    # Effective servername. converters.parse_proxy writes
+    # `sni = _clean_sni(obj.get("sni") or obj.get("host"))`, and both converters
+    # can therefore emit that value even when TLS is absent. Three direct byte-level
+    # measurements showed tcp+with-sni vs tcp+without-sni, host-vs-sni, and grpc
+    # with-sni vs without-sni all produce different client output. Without this
+    # component those pairs would get one key and one would die silently as a
+    # duplicate.
+    srv = _norm_identity_value("sni", str(obj.get("sni") or "") or
+                               str(obj.get("host") or ""))
+    if srv and not _is_plausible_fronting_host(srv):
+        srv = ""
+
+    # host or sni merged "host=X, sni=∅" with "host=∅, sni=X" even though the
+    # product emits them to *different* fields (HTTP Host vs TLS servername), so
+    # they are different artefacts and must split.
+    fronting = f"{host}~{sni}" if sni else host
+
+    # The real server host never leaves the key now. fronting no longer replaces
+    # it, which was the phase-I fix.
+    return (
+        f"vmess:{add}|ep={fronting}"
+        f":{str(obj.get('port', '')).strip()}"
+        f":{str(obj.get('id', '')).strip().lower()}"
+        # alterId is emitted to both targets and mihomo feeds it into newAlterIDs.
+        # No equivalence was proven, so the safe direction is to split, not merge.
+        f":{net}:{path}:{tls}"
+        f":{_norm_aid(obj.get('aid'))}"
+        # `scy` is emitted verbatim to both targets. Lowercasing it would have
+        # merged AUTO and auto while their output differs byte for byte.
+        f":{str(obj.get('scy') or 'auto')}"
+        f":srv={srv}"
+    )
 
 
 def dedup_key(line: str) -> str:
-    """Fingerprint هویتِ سرور — CDN-aware (دقیقاً معادل ربات)."""
+    """The server identity fingerprint, CDN aware.
+
+    Exactly the same semantics as the bot, only refactored into a couple of small
+    helpers so the function is readable without changing how the repo keys itself.
+    """
     line = line.strip()
     if not line:
         return line
 
-    if line.startswith("vmess://"):
+    vmess = _vmess_json(line)
+    if vmess is not None:
         try:
-            b64 = line[8:].split("#")[0].strip()
-            _txt = decode_base64_text(b64)
-            if _txt is None:
-                raise ValueError("vmess payload is not base64")
-            obj = json.loads(_txt)
-            add = (str(obj.get("add") or "")).strip().lower()
-            host = _norm_identity_value("host", str(obj.get("host") or ""))
-            sni = _norm_identity_value("sni", str(obj.get("sni") or ""))
-            tls = (str(obj.get("tls") or "")).strip().lower()
-            # هر مقداری که مبدّلِ خودِ این مخزن آن را «TLS» نمی‌شمارد، با
-            # «بی‌TLS» یکسان است. مرجع: `converters.py:553` که مقدار را به
-            # بولین بدل می‌کند (`in ("tls", "reality")`)، و
-            # `pipeline.py:94` (`FS_TLS_VALUES = {"tls","reality","xtls"}`).
-            # پس `auto`/`none`/`""`/هر زبالهٔ دیگر ⇒ خروجیِ مو‌به‌مو یکسان.
-            # `xtls` عامدانه در فهرست نگه داشته شده تا این قاعده فقط
-            # بتواند بشکافد، نه ادغام کند (جهتِ محافظه‌کارانه).
-            tls = tls if tls in ("tls", "reality", "xtls") else ""
-            net = _norm_type(str(obj.get("net") or ""))
-            path = str(obj.get("path") or "")
-            # ★ فاز J / J-7d: تنها هم‌ارزیِ اثبات‌شده («» ≡ «/») نگه داشته
-            # می‌شود؛ `rstrip("/")` پیشین `/abc/` را هم با `/abc` یکی
-            # می‌کرد که دو مسیرِ متفاوتِ HTTP‌اند (RFC 3986 §6.2.2).
-            path = "/" if path == "" else path
-            # اعتبارسنجیِ مقدارِ fronting پیش از سپردنِ هویت به آن — چراییِ
-            # کامل در `_is_plausible_fronting_host` و `_sni_is_endpoint`.
-            if host and not _is_plausible_fronting_host(host):
-                host = ""
-            # `sni` تنها وقتی «نقطهٔ پایانی» است که TLS آن را نامِ سرور کند.
-            # این نگهبان دست‌نخورده می‌ماند؛ رسیدنِ `sni` به خروجی از راهِ
-            # **دیگر** (servername/هدرِ Host، بی‌نیاز از TLS) پایین‌تر با
-            # مؤلفهٔ `srv=` پوشش داده می‌شود — فاز K / K-D.
-            if sni and not (_is_plausible_fronting_host(sni)
-                            and _sni_is_endpoint(tls)):
-                sni = ""
-            # ★ فاز K / K-D — «نامِ سرورِ مؤثر» (effective servername).
-            #
-            # چرا لازم است: `converters.parse_proxy` در شاخهٔ vmess می‌نویسد
-            # `"sni": _clean_sni(obj.get("sni") or obj.get("host"))`
-            # (`converters.py:558`) و `_to_clash_proxy` آن را **بی‌قید و شرط**
-            # امیت می‌کند: `if p["sni"]: out["servername"] = p["sni"]`
-            # (`converters.py:854-855`) — نه TLS شرطش است و نه transport.
-            # پس `sni` حتی در `net=tcp`/`grpc` و بی‌TLS هم به خروجی می‌رسد.
-            # سنجشِ مستقیمِ بایت‌ها (۳ جفتِ همزاد، `/tmp/k5_diag.py`):
-            #     net=tcp  + sni  ⇒ clash `servername` هست / نیست  → متفاوت
-            #     host + sni متفاوت ⇒ `servername` دو مقدارِ متفاوت → متفاوت
-            #     net=grpc + sni  ⇒ `servername` هست / نیست        → متفاوت
-            # نگهبانِ بالا این مقدار را صفر می‌کند، پس بی این مؤلفه هر سه
-            # جفت **یک کلید** می‌گرفتند و یکی خاموش به `r.duplicates` می‌رفت
-            # (زیانِ «الف»: حذفِ بی‌صدا). در پیکرهٔ امروز چنین جفتی نیست، پس
-            # نقصْ **نهفته** بود؛ ولی جهتِ زیان همان است و باید بسته شود.
-            #
-            # چرا `sni or host` و نه `sni` تنها: مبدّل همین fallback را دارد.
-            # نسخهٔ بی‌fallback سنجیده شد و **۳ افرازِ کاذب** ساخت، چون در
-            # پیکره خطوطی هستند که `sni == host` دارند و خطِ همزادشان `sni`
-            # ندارد — خروجی‌شان مو‌به‌مو یکسان است. با fallback: **۰**.
-            #
-            # کاملیِ اثبات‌شده: هر دو مصرف‌کنندهٔ خروجی تابعی از همین جفت‌اند —
-            # `servername = sni or host` و هدرِ Host در ws/h2/grpc
-            # (`converters.py:792` و `:1102`) `= host or sni`. کلید هم `host`
-            # را دارد و هم `sni or host`، پس جفت را یکتا تعیین می‌کند.
-            #
-            # سنجش روی پیکرهٔ کامل (۱۸٬۷۳۵ خط): این مؤلفه به‌تنهایی جای
-            # نگهبانِ فهرست‌محورِ K-C را می‌گیرد و **افرازِ یکسان** می‌سازد
-            # (loss ۴۷→۴۲، افرازِ کاذب ۰، گروهِ شکافته‌شده ۰) — پس فهرستِ
-            # `_HOST_HEADER_NETS` که داوریِ دستی دربارهٔ transportها بود
-            # حذف شد و یک دستهٔ کاملِ خطای آینده با آن رفت.
-            srv = _norm_identity_value(
-                "sni", str(obj.get("sni") or "") or str(obj.get("host") or ""))
-            if srv and not _is_plausible_fronting_host(srv):
-                srv = ""
-            # ★ فاز J / J-7b: `host or sni` این دو را قاطی می‌کرد، پس
-            # «host=X, sni=∅» و «host=∅, sni=X» یک کلید می‌گرفتند و یکی
-            # خاموش حذف می‌شد — در حالی که محصول آن‌ها را به **دو فیلدِ
-            # متفاوت** امیت می‌کند (`Host` در clash و `servername`/
-            # `server_name` در TLS). پس دو مصنوعِ متمایزند.
-            fronting = f"{host}~{sni}" if sni else host
-            # ★ فازِ I: fronting دیگر میزبانِ واقعی را جانشین نمی‌شود.
-            add_for_key = add
-            return (
-                f"vmess:{add_for_key}|ep={fronting}"
-                f":{str(obj.get('port', '')).strip()}"
-                f":{str(obj.get('id', '')).strip().lower()}"
-                # ★ فاز J / J-7c: `alterId` هم امیت می‌شود (`alterId` در
-                # clash و `alter_id` در sing-box) و mihomo آن را به
-                # `newAlterIDs` می‌دهد. هم‌ارزی **اثبات نشد**، پس بر پایهٔ
-                # قاعدهٔ «در تردید، ادغام نکن» می‌شکافیم.
-                f":{net}:{path}:{tls}"
-                f":{_norm_aid(obj.get('aid'))}"
-                # ★ فاز K / K-A: `scy` رمزنگاریِ VMess است و امیت می‌شود:
-                # `converters.py:551` آن را می‌خواند، `:852` به `cipher`
-                # (clash) و `:1143` به `security` (sing-box) می‌نویسد —
-                # **حرف‌به‌حرف و بی‌کوچک‌سازی**. پس کلید هم عیناً همان را
-                # می‌گیرد؛ کوچک‌کردنش «AUTO» و «auto» را ادغام می‌کرد در
-                # حالی که خروجی‌شان متفاوت است. سنجیده شد: ۱ کانفیگ نجات،
-                # ۰ افرازِ کاذب.
-                f":{str(obj.get('scy') or 'auto')}"
-                # ★ فاز K / K-D — چرایی در بالا، کنارِ محاسبهٔ `srv`.
-                f":srv={srv}"
-            )
+            return _vmess_identity(vmess, line)
         except Exception:
             return line.split("#")[0].strip()[:120]
 
@@ -1010,33 +908,14 @@ def dedup_key(line: str) -> str:
         try:
             without_remark = line.split("#")[0].strip()
             rest = without_remark[5:]
-            # جدا کردنِ authority از query — پیش از هر rsplit روی '@'.
-            #
-            # چرا: پیش از این `rest.rsplit("@", 1)` روی **کلِ** رشته اجرا می‌شد.
-            # اگر query خودش '@' داشت (در دادهٔ واقعی فراوان است، مثلِ
-            # `?note=@SomeChannel`)، آخرین '@' داخلِ query بود و نتیجه:
-            #
-            #   ss://<b64>@1.2.3.4:11201?note=@FreeOnlineVPN
-            #     userinfo → "<b64>@1.2.3.4:11201?note="   (دیگر base64 نیست)
-            #     hostpart → "FreeOnlineVPN"
-            #     host     → ""            port → "FreeOnlineVPN"
-            #
-            # یعنی هویتِ endpoint کاملاً نابود می‌شد. شمارشِ زنده روی پیکره:
-            # ۱۴ کلید از ۳٬۰۰۶ خطِ ss (۱۲ موردِ '@' در query + ۲ موردِ '/'
-            # چسبیده به port). پس از وصله: ۰ کلید با hostِ خالی یا portِ
-            # غیرعددی. پارتیشنِ یکتاسازی عوض نمی‌شود (splits=0, merges=0).
-            #
-            # قاعده **عیناً** همان است که `endpoint_of()` در همین فایل به‌کار
-            # می‌برد: (۱) برشِ query  (۲) rsplit روی '@'  (۳) برشِ path.
-            # عمداً سرِ '/' *قبل از* rsplit نمی‌بُریم: userinfoِ SS2022 حاویِ
-            # base64ِ استاندارد است و '/' و '+' رمزنگاری‌نشده دارد، مثلِ
-            # `ss://2022-blake3-aes-256-gcm:bw2o/kKF…=:o0BV…=@host:port` —
-            # بریدن سرِ '/' آن را به شاخهٔ legacy می‌انداخت و کلید را خراب‌تر
-            # می‌کرد.
+            # Split authority from query before any rsplit("@"). If the query itself
+            # contains '@' (common in real data, e.g. `?note=@SomeChannel`), a raw
+            # rsplit on the whole string makes the last @ come from the query and the
+            # host collapses to nonsense. Measured on the live corpus: 14 bad keys
+            # among 3,006 ss lines (12 query @ cases + 2 '/' after port cases).
             authority = rest.split("?", 1)[0]
             if "@" in authority:
                 userinfo, hostpart = authority.rsplit("@", 1)
-                # host:port هرگز '/' ندارد؛ userinfo می‌تواند داشته باشد.
                 hostpart = hostpart.split("/", 1)[0]
                 decoded_ui = decode_base64_text(userinfo)
                 if decoded_ui and ":" in decoded_ui:
@@ -1044,120 +923,76 @@ def dedup_key(line: str) -> str:
                 userinfo = urllib.parse.unquote(userinfo).lower()
                 host, _, port = hostpart.rpartition(":")
                 return f"ss:sip002:{userinfo}@{host.lower()}:{port}"
-            else:
-                decoded = decode_base64_text(rest)
-                if decoded is None:
-                    raise ValueError("ss legacy body is not base64")
-                # ★ یکی‌سازیِ دو فرمِ Shadowsocks. بدنهٔ رمزگشایی‌شدهٔ فرمِ قدیم
-                # دقیقاً `method:pass@host:port` است — همان چیزی که شاخهٔ
-                # SIP002 از اجزای جدا می‌سازد. پیش از این، یک سرورِ یکسان که
-                # هم به فرمِ قدیم و هم به فرمِ SIP002 آمده بود دو کلید می‌گرفت
-                # و **دو بار** منتشر می‌شد (۴ مورد در پیکره).
-                # ادغامِ کاذبِ تازه ساختاراً ناممکن است: یکی شدن فقط وقتی رخ
-                # می‌دهد که روش، گذرواژه، میزبان و پورت هر چهار یکی باشند.
-                _d = decoded.split("#")[0].split("?")[0]
-                if "@" in _d:
-                    _ui, _hp = _d.rsplit("@", 1)
-                    _hp = _hp.split("/", 1)[0]
-                    _h, _, _pt = _hp.rpartition(":")
-                    if _h and _pt:
-                        _ui = urllib.parse.unquote(_ui).lower()
-                        return f"ss:sip002:{_ui}@{_h.lower()}:{_pt}"
-                return f"ss:legacy:{decoded.lower()}"
+            decoded = decode_base64_text(rest)
+            if decoded is None:
+                raise ValueError("ss legacy body is not base64")
+            # Unify the two Shadowsocks forms. The decoded legacy body is exactly
+            # `method:pass@host:port`, i.e. the same structure as the SIP002 branch.
+            # Before this, one server published in both forms got two keys and was
+            # emitted twice. Real duplicates fixed: 4. No new false merge is
+            # structurally possible unless method, password, host and port all match.
+            decoded_no_frag = decoded.split("#")[0].split("?")[0]
+            if "@" in decoded_no_frag:
+                userinfo, hostpart = decoded_no_frag.rsplit("@", 1)
+                hostpart = hostpart.split("/", 1)[0]
+                host, _, port = hostpart.rpartition(":")
+                if host and port:
+                    userinfo = urllib.parse.unquote(userinfo).lower()
+                    return f"ss:sip002:{userinfo}@{host.lower()}:{port}"
+            return f"ss:legacy:{decoded.lower()}"
         except Exception:
             return line.split("#")[0].strip()[:120]
 
-    # ★ فاز O4 — کلیدِ ساختاریِ ssr به‌جای کلیدِ متنیِ base64.
+    # Structural ssr key instead of the raw base64 text.
     #
-    # چرا لازم بود: شاخهٔ عمومیِ پایین `urlparse` را روی `ssr://<base64>`
-    # اجرا می‌کرد. آن base64 **کلِ** بدنه است (میزبان، پورت، رمز، پارامترها و
-    # حتی `remarks`/`group`)، پس کلید عملاً «رشتهٔ رمزشده» می‌شد. دو پیامدِ
-    # اندازه‌گیری‌شده روی پیکرهٔ ۳۳٬۰۶۶ خطی (۱۱۲ خطِ ssr):
-    #   ۱. یک نودِ یکسان که با padding یا الفبای متفاوت (`+/` در برابر `-_`)
-    #      یا با `remarks`/`group`ِ دیگر آمده بود، **کلیدِ متفاوت** می‌گرفت
-    #      ⇒ افرازِ کاذب. اندازه‌گیری: ۵۲ گروه → ۲۸ گروه (۲۴ ادغام، هیستوگرامِ
-    #      کاملاً یکنواختِ {۴: ۲۸}).
-    #   ۲. `endpoint_of` هم روی همان رشته کار می‌کرد ⇒ GeoIP همیشه شکست ⇒
-    #      همهٔ ۱۱۲ خط برچسبِ «Global 🌐». حالا ۹۶ خط کشورِ واقعی می‌گیرند.
+    # The old generic branch urlparsed `ssr://<base64>`, so the key was effectively
+    # just the encrypted blob, including remarks/group. Consequences measured on the
+    # 33,066-line corpus (112 ssr lines):
+    #   1) one identical node published with different padding/alphabet or
+    #      different remarks/group got different keys -> false splits. 52 groups
+    #      collapsed to 28, a perfectly uniform {4: 28} histogram.
+    #   2) endpoint_of() saw the same blob as the host -> GeoIP always failed -> all
+    #      112 lines became Global 🌐. With decoding, 96 get their real country.
     #
-    # ایمنیِ اثبات‌شده پیش از تغییر (`o4_probe.py` + `o4_probe2.py`):
-    #   • `data_killing_merges = 0` — هیچ‌یک از ۲۴ ادغام دو مصنوعِ متمایز را
-    #     یکی نکرد؛ هر ۲۴ گروه **یک** مصنوعِ یکتا داشتند.
-    #   • `false_splits = 0` · زیانِ کل ۹۹ → ۹۹ (Δ صفر).
-    #   • sha256ِ کلیدهای ۳۲٬۹۵۴ خطِ غیر-ssr **مو‌به‌مو یکسان** ⇒ هیچ طرحِ
-    #     دیگری تکان نخورد.
-    #   • برخوردِ بین‌طرحی: ۰ (پیشوندِ یکتای `ssr:` مثلِ بقیهٔ شاخه‌ها).
-    #
-    # مجموعهٔ هویتی = عیناً همان چیزی که مبدل امیت می‌کند، منهای `name`.
-    # مقادیر **خام**اند (نه `_sanitize_ssr`-شده): پاک‌سازی چندبه‌یک است و
-    # می‌توانست دو کانفیگِ متمایز را ادغام کند. چراییِ کامل در `_ssr_parts`.
+    # Safety was measured before the change:
+    #   - data_killing_merges = 0. None of the 24 merges collapsed distinct
+    #     artefacts; each merged group had exactly one unique artefact.
+    #   - false_splits = 0, total loss unchanged.
+    #   - keys of the 32,954 non-ssr lines were byte-for-byte identical.
+    #   - cross-scheme collisions = 0 thanks to the unique `ssr:` prefix.
     if line.startswith("ssr://"):
         try:
-            p = _ssr_parts(line)
-            if p:
-                host, port_s, proto, method, obfs, pwd, obfsparam, protoparam = p
-                # میزبان/پروتکل/متد/obfs بی‌حساسیت به بزرگ‌وکوچک‌اند (نام
-                # دامنه و شناسه‌های ثابت)، ولی گذرواژه و پارامترها **نه** —
-                # مبدل آن‌ها را حرف‌به‌حرف امیت می‌کند، پس کوچک‌کردنشان
-                # دو خروجیِ متفاوت را ادغام می‌کرد.
-                #
-                # ★ چرا `quote`: سه جزءِ آزادمتنِ آخر (گذرواژه و دو پارامتر)
-                # می‌توانند خودشان «:» و «=» داشته باشند، و آن‌وقت کلید
-                # **یک‌به‌یک نیست**. این حرف نظری نیست؛ جهش‌آزمایی (M4) آن را
-                # لو داد و با دو خطِ واقعی اثبات شد:
-                #
-                #   pwd="x:op=y", op=""      ⟶ …:x:op=y:op=:pp=
-                #   pwd="x",      op="y:op=" ⟶ …:x:op=y:op=:pp=   ← یک کلید!
-                #
-                # هر دو را `parse_proxy` می‌پذیرد و مصنوعشان **متفاوت** است
-                # (گذرواژه و obfs_paramِ متفاوت) ⇒ یکی خاموش حذف می‌شد؛ همان
-                # «ادغامِ داده‌کُش» که کلِ این فاز برای بستنش است.
-                #
-                # `quote(safe="")` هر «:» را به `%3A`، هر «=» را به `%3D` و هر
-                # «%» را به `%25` بدل می‌کند. پس هیچ جزئی نمی‌تواند جداکننده
-                # بسازد و کلید به یک چندگانهٔ ۹جزئیِ بی‌ابهام تبدیل می‌شود.
-                # چهار جزءِ نخست ساختاراً «:»-ندارند (از `split(":")` با شمارِ
-                # الزامیِ شش آمده‌اند)، پس نیازی به گریز ندارند و خوانا می‌مانند.
-                q = urllib.parse.quote
+            parts = _ssr_parts(line)
+            if parts:
+                host, port, proto, method, obfs, pwd, obfsparam, protoparam = parts
+                quote = urllib.parse.quote
                 return (
-                    f"ssr:{host.strip().lower()}:{port_s}"
+                    f"ssr:{host.strip().lower()}:{port}"
                     f":{proto.strip().lower()}:{method.strip().lower()}"
-                    f":{obfs.strip().lower()}:{q(pwd, safe='')}"
-                    f":op={q(obfsparam, safe='')}:pp={q(protoparam, safe='')}"
+                    f":{obfs.strip().lower()}:{quote(pwd, safe='')}"
+                    f":op={quote(obfsparam, safe='')}:pp={quote(protoparam, safe='')}"
                 )
         except Exception:
             pass
-        # تجزیه‌نشدنی → **هیچ تغییری**؛ به شاخهٔ عمومیِ پایین می‌افتد، یعنی
-        # عیناً کلیدِ امروز. سه دلیلِ عمدی برای اینکه این‌جا مثلِ شاخه‌های
-        # vmess/ss به `[:120]` برنمی‌گردیم:
-        #   ۱. سنجه‌ها با همین معنا گرفته شدند (`o4_probe.py:200` برای موردِ
-        #      تجزیه‌نشدنی `k_before` را نگه می‌دارد). هر معنای دیگری یعنی
-        #      رفتاری که **اندازه‌گیری نشده** — و ادعای بی‌سنجه ممنوع است.
-        #   ۲. بریدنِ ۱۲۰ نویسه خودش خطرِ ادغام می‌سازد: بدنه‌های ssrِ واقعی
-        #      بلندترند، پس دو کانفیگِ متمایز با پیشوندِ مشترک یک کلید
-        #      می‌گرفتند — همان «ادغامِ الکی» که ممنوع است.
-        #   ۳. بی‌اثر بودنش روی خروجی اثبات‌شده است: هر خطی که این تجزیه‌کننده
-        #      رد کند، `converters.parse_proxy` هم رد می‌کند (گرامرِ آینه‌ای،
-        #      قفل‌شده با تستِ ضدواگرایی)، پس هرگز به خروجی نمی‌رسد و افرازش
-        #      دیده نمی‌شود.
+        # Unparseable -> unchanged legacy behaviour. Do *not* slice to 120 chars like
+        # vmess/ss: those slices create artificial merges on long ssr bodies, i.e. the
+        # exact false-merge direction this phase exists to close.
 
     try:
         without_remark = line.split("#")[0].strip()
         parsed = urllib.parse.urlparse(without_remark)
         raw_params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-        meaningful = {}
-        for pk, pv in raw_params.items():
-            kl = pk.strip().lower()
-            if kl not in _IDENTITY_PARAMS:
+        meaningful: Dict[str, str] = {}
+        for param_key, param_values in raw_params.items():
+            key = param_key.strip().lower()
+            if key not in _IDENTITY_PARAMS:
                 continue
-            nv = _norm_identity_value(kl, str(pv[0]) if pv else "")
-            if nv != "":
-                meaningful[kl] = nv
-        # ★ فاز K / K-B: `insecure` تفاوتِ «گواهی را بررسی کن» و «نکن» است و
-        # در hysteria2/tuic به خروجی می‌رسد، پس هویت‌ساز است. دامنه‌اش عامدانه
-        # همان دو پروتکل است: افزودنِ بی‌دامنه سنجیده شد و **۷۶ افرازِ کاذب**
-        # ساخت، چون `_to_clash_proxy` برای vless/trojan هیچ `skip-cert-verify`
-        # نمی‌نویسد ⇒ پارامترِ نارسا. با دامنه: ۱ کانفیگ نجات، ۰ افرازِ کاذب.
+            normalised = _norm_identity_value(key, str(param_values[0]) if param_values else "")
+            if normalised != "":
+                meaningful[key] = normalised
+        # `insecure` is identity-bearing for hysteria2/tuic because it reaches the
+        # output there. Adding it out of scope created 76 false splits in testing,
+        # because vless/trojan never emit skip-cert-verify.
         if parsed.scheme.lower() in _INSECURE_SCHEMES:
             meaningful["insecure"] = _insecure_flag(raw_params)
         username = urllib.parse.unquote(parsed.username or "").lower()
@@ -1168,48 +1003,40 @@ def dedup_key(line: str) -> str:
         except Exception:
             port = ""
         path = parsed.path.rstrip("/")
-        sni_val = meaningful.get("sni", "")
-        host_val = meaningful.get("host", "")
-        # ── اعتبارسنجیِ fronting ─────────────────────────────────────────────
-        # دو نوعِ **متفاوت** ردکردن، با پیامدهای متفاوت:
-        #   (۱) مقدار hostname معتبر **نیست** ⇒ زباله است و هیچ اطلاعِ هویتی
-        #       ندارد ⇒ کاملاً از `meaningful` حذف می‌شود. اگر فقط «تنزیل» شود و
-        #       در query بماند، همان زباله هویت را می‌شکند: سنجیده شد که ۳۶
-        #       افراز، **یک** نقطهٔ پایانیِ واقعی را به چند کلید می‌بردند، چون
-        #       یک خط `host=/?bia_telegram@…` داشت و خطِ دیگر نداشت.
-        #   (۲) مقدار معتبر است ولی قاعدهٔ TLS/REALITY آن را نقطهٔ پایانی
-        #       نمی‌داند ⇒ یک پارامترِ واقعیِ کانفیگ است و **در query می‌ماند**،
-        #       تا تمایزهای امروزی حفظ شوند و افرازِ تازه‌ای ساخته نشود.
-        security_val = meaningful.get("security", "")
-        if sni_val and not _is_plausible_fronting_host(sni_val):
-            sni_val = ""
-            meaningful.pop("sni", None)                       # (۱)
-        elif sni_val and not _sni_is_endpoint(security_val):
-            sni_val = ""                                      # (۲)
-        if host_val and not _is_plausible_fronting_host(host_val):
-            host_val = ""
-            meaningful.pop("host", None)                      # (۱)
-        # ─────────────────────────────────────────────────────────────────────
-        fronting_domain = sni_val or host_val
-        # ★ فازِ I: هم میزبانِ واقعی و هم دامنهٔ fronting در کلید می‌مانند.
-        endpoint = fronting_domain
-        host_for_key = conn_host
-        sorted_query = "&".join(f"{k2}={meaningful[k2]}" for k2 in sorted(meaningful))
+        sni_value = meaningful.get("sni", "")
+        host_value = meaningful.get("host", "")
+
+        # fronting validation.
+        # Two kinds of rejection, with different effects:
+        #   (1) the value is not even a valid hostname -> it is garbage and leaves
+        #       `meaningful` entirely, or garbage splits one real endpoint into
+        #       several keys.
+        #   (2) the value is valid but this TLS/REALITY rule does not let it define
+        #       the endpoint -> it is still a real config param and stays in the
+        #       query, preserving current distinctions without creating new splits.
+        security_value = meaningful.get("security", "")
+        if sni_value and not _is_plausible_fronting_host(sni_value):
+            sni_value = ""
+            meaningful.pop("sni", None)
+        elif sni_value and not _sni_is_endpoint(security_value):
+            sni_value = ""
+        if host_value and not _is_plausible_fronting_host(host_value):
+            host_value = ""
+            meaningful.pop("host", None)
+
+        fronting_domain = sni_value or host_value
+        sorted_query = "&".join(f"{k}={meaningful[k]}" for k in sorted(meaningful))
         return (
             f"{parsed.scheme.lower()}:"
             f"{username}:{password}"
-            f"@{host_for_key}|ep={endpoint}"
+            f"@{conn_host}|ep={fronting_domain}"
             f":{port}{path}?{sorted_query}"
         )
     except Exception:
         pass
     return line.split("#")[0].strip()[:200]
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# تشخیص کانفیگ خراب/جعلی (vendored از subscription._is_dummy_config)
-# ──────────────────────────────────────────────────────────────────────────────
-
+# Broken/fake config detection, vendored from subscription._is_dummy_config.
 _DUMMY_INDICATORS = (
     "00000000-0000-0000-0000-000000000000",
     "app%20not%20supported",
@@ -1219,57 +1046,32 @@ _DUMMY_INDICATORS = (
 
 
 def is_dummy_config(config: str) -> bool:
-    """تشخیص کانفیگ جعلی/خراب."""
+    """Whether the config is fake or broken."""
     if not config:
         return False
-    c = config.lower()
-    return any(ind in c for ind in _DUMMY_INDICATORS)
+    lowered = config.lower()
+    return any(indicator in lowered for indicator in _DUMMY_INDICATORS)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# برندینگ ریمارک (vendored از freeconfigs._rename_free_config_remark)
-# ──────────────────────────────────────────────────────────────────────────────
+# Remark branding, vendored from freeconfigs._rename_free_config_remark.
 
 def brand_remark(line: str, idx=None) -> str:
-    """
-    برندینگ: «{CC} {flag} | @Raydikalx | {tag}».
+    """Brand a config as ``{CC} {flag} | @Raydikalx | {tag}``.
 
-    `tag` از محتوای کانفیگ مشتق می‌شود، نه از موقعیتِ خط. پارامترِ `idx` برای
-    سازگاری با فراخوان‌های قدیمی پذیرفته می‌شود ولی در برچسب به کار نمی‌رود؛
-    اگر شماره‌گذاریِ موقعیتی به ریمارک برگردد، افزودنِ یک کانفیگ ریمارکِ همهٔ
-    خطوطِ بعدی را جابه‌جا می‌کند و فایل در هر انتشار از نو نوشته می‌شود.
+    The `tag` is derived from the config content, not from the line position. The
+    `idx` parameter is still accepted for backwards compatibility with old callers,
+    but it is no longer used in the label. Putting positional numbering back in the
+    remark would shift every later line's remark when one config is inserted and
+    make the whole file look rewritten.
     """
     line = line.strip()
     if not line:
         return line
 
     tag = stable_label(line)
-
-    # نکته: «vmess بودن» مساویِ «base64+JSON بودن» نیست. بعضی منابع vmess را در
-    # قالبِ استانداردِ URI می‌دهند. پیش از این، شکستِ JSON به `return line` می‌رسید
-    # و کانفیگ *برندنخورده* منتشر می‌شد — یعنی ریمارکِ بالادست، از جمله تبلیغِ
-    # کانالِ رقیب، در خروجیِ ما می‌ماند. اندازه‌گیریِ زنده: ۱ مورد از ۸٬۰۱۸ با
-    # ریمارکِ «📯1@oneclickvpnkeys». پس فقط وقتی مسیرِ JSON را می‌رویم که واقعاً
-    # JSON باشد؛ در غیرِ این‌صورت به مسیرِ عمومیِ fragment می‌افتیم که همان کار را
-    # برای vless/trojan/… انجام می‌دهد.
-    _vmess_obj = None
-    if line.startswith("vmess://"):
+    vmess = _vmess_remark_source(line)
+    if vmess is not None:
         try:
-            # مهم: بخش fragment (#...) باید قبل از decode جدا شود، وگرنه
-            # base64 خراب می‌شود و برندینگ خاموشانه رد می‌شود (کانفیگ بدون برند
-            # از پایپ‌لاین بیرون می‌آید). dedup_key هم همین کار را می‌کند.
-            b64 = line[8:].split("#")[0].strip()
-            _txt = decode_base64_text(b64)
-            _cand = json.loads(_txt) if _txt is not None else None
-            if isinstance(_cand, dict):
-                _vmess_obj = _cand
-        except Exception:
-            _vmess_obj = None
-
-    if _vmess_obj is not None:
-        try:
-            obj = _vmess_obj
-            old_ps = str(obj.get("ps") or obj.get("name") or "")
+            obj, old_ps = vmess
             code, flag = country_for_endpoint(endpoint_of(line), old_ps)
             label = "Global 🌐" if code == "Global" else f"{code} {flag}"
             new_ps = f"{label} | {BRAND_CHANNEL} | {tag}"
@@ -1298,85 +1100,64 @@ def brand_remark(line: str, idx=None) -> str:
     new_remark = f"{label} | {BRAND_CHANNEL} | {tag}"
     return f"{core}#{new_remark}"
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# راستی‌آزماییِ برند
-# ──────────────────────────────────────────────────────────────────────────────
+# Brand verification.
 
 def remark_of(line: str) -> str:
-    """ریمارکِ قابلِ‌مشاهده‌ی کاربر را برمی‌گرداند (یا رشتهٔ تهی).
+    """The user-visible remark, or an empty string.
 
-    «قابلِ مشاهده» عمداً تأکید شده: در `vmess://` ریمارک درونِ JSONِ base64شده
-    (کلیدِ `ps`) می‌نشیند و در متنِ خامِ خط **دیده نمی‌شود**، ولی کلاینت آن را
-    به کاربر نشان می‌دهد. پس هر بازرسیِ برند که فقط `BRAND_CHANNEL in line`
-    را چک کند، روی همهٔ vmessها منفیِ کاذب می‌دهد (اندازه‌گیری‌شده: ۲٬۳۷۳ نود
-    از ۸٬۱۳۶ در دادهٔ زنده). این تابع همان چیزی را می‌خواند که کاربر می‌بیند.
+    "Visible" is deliberate: in vmess:// the remark lives inside base64 JSON (`ps`)
+    and is *not* visible in the raw line, yet the client shows it to the user. Any
+    brand check that just does ``BRAND_CHANNEL in line`` is therefore false-negative
+    on every vmess node (measured: 2,373 out of 8,136 in live data).
     """
     if not line:
         return ""
-    s = line.strip()
-    if s.startswith("vmess://"):
-        b64 = s[8:].split("#")[0].strip()
-        txt = decode_base64_text(b64)
-        if txt is not None:
-            try:
-                obj = json.loads(txt)
-                if isinstance(obj, dict):
-                    return str(obj.get("ps") or obj.get("name") or "")
-            except Exception:
-                pass
-        # vmessِ غیرِJSON (قالبِ URI) از مسیرِ fragment برند می‌خورد — بیفت پایین
-    if "#" in s:
-        return s.split("#", 1)[1]
+    text = line.strip()
+    if text.startswith("vmess://"):
+        vmess = _vmess_json(text)
+        if vmess is not None:
+            return str(vmess.get("ps") or vmess.get("name") or "")
+        # URI-style vmess is branded through the fragment, so fall through
+    if "#" in text:
+        return text.split("#", 1)[1]
     return ""
 
 
 def is_branded(line: str) -> bool:
-    """آیا ریمارکِ این خط `BRAND_CHANNEL` را دارد؟
+    """Whether the visible remark carries BRAND_CHANNEL.
 
-    این تابع **تعریفِ اجراییِ** ناوردایِ برندینگ است (سیاست، بالای همین فایل).
-    یک‌جا نگه‌داشتنش لازم است چون سه مصرف‌کننده دارد که نباید واگرا شوند:
-    دروازهٔ انتشار در `aggregate.py`، آزمون‌های `test_pipeline.py`، و هر
-    ابزارِ بازرسیِ آینده.
+    This is the executable definition of the branding invariant. It has to live in
+    one place because three consumers rely on it and must not drift:
+    aggregate.py's publish gate, test_pipeline.py, and any future inspection tool.
 
-    سنجش روی *ریمارک* است نه کلِ خط: `BRAND_CHANNEL in line` هم منفیِ کاذب
-    می‌دهد (vmess، بالا) و هم مثبتِ کاذب — مثلاً میزبانی که تصادفاً رشتهٔ
-    برند را در query داشته باشد، «برنددار» شمرده می‌شد در حالی که کاربر هیچ
-    برندی نمی‌بیند.
+    The check is on the remark, not the whole line: ``BRAND_CHANNEL in line`` is
+    both false-negative on vmess and false-positive on e.g. a host/query that
+    happens to contain the brand while the user sees none.
     """
     return BRAND_CHANNEL in remark_of(line)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# تشخیص پروتکل
-# ──────────────────────────────────────────────────────────────────────────────
+# Protocol detection.
 
 def protocol_of(line: str) -> Optional[str]:
-    """
-    نامِ canonical پروتکلِ یک کانفیگ را برمی‌گرداند (هوشمند).
-    برای هر scheme:// معتبر کار می‌کند — حتی پروتکل‌های جدید/ناشناخته.
-    """
+    """Canonical protocol name of a config, smart and future-proof."""
     if not line:
         return None
-    m = _URI_SCHEME_RE.match(line.strip())
-    if not m:
+    match = _URI_SCHEME_RE.match(line.strip())
+    if not match:
         return None
-    scheme = m.group(1).lower()
+    scheme = match.group(1).lower()
     if scheme in _NON_PROXY_SCHEMES:
         return None
     return normalize_scheme(scheme)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# base64 decode (vendored از fetcher._try_base64_decode)
-# ──────────────────────────────────────────────────────────────────────────────
+# base64 decoding for whole source blobs, vendored from fetcher._try_base64_decode.
 
 def try_base64_decode(raw: str) -> Optional[str]:
-    """دیکد امن base64 با بررسی کیفیت (density >= 20%)."""
-    clean_raw = re.sub(r"\s+", "", raw)
-    if not clean_raw:
+    """Safe base64 decode with a quality gate: at least 20% valid config lines."""
+    clean = re.sub(r"\s+", "", raw)
+    if not clean:
         return None
-    padded = clean_raw + "=" * (-len(clean_raw) % 4)
+    padded = clean + "=" * (-len(clean) % 4)
     for decoder in (base64.urlsafe_b64decode, base64.b64decode):
         try:
             decoded_bytes = decoder(padded)
@@ -1388,7 +1169,7 @@ def try_base64_decode(raw: str) -> Optional[str]:
                 non_empty = [ln.strip() for ln in text.splitlines() if ln.strip()]
                 if not non_empty:
                     continue
-                # هوشمند: هر scheme:// معتبر (نه فقط prefixهای ثابت) شمارش می‌شود
+                # Smart: count any valid scheme:// line, not just a fixed prefix list
                 valid = [ln for ln in non_empty if is_proxy_config(ln)]
                 if valid and (len(valid) / len(non_empty)) >= 0.20:
                     return text
@@ -1396,77 +1177,72 @@ def try_base64_decode(raw: str) -> Optional[str]:
                 continue
     return None
 
-
-# ── بازسازیِ جداکنندهٔ `&` که به‌صورتِ موجودیتِ HTML خراب شده است ─────────────
-# چرا لازم است: `urllib.parse.parse_qs` روی `&` می‌شکند. اگر منبع، لینک را از
-# دلِ HTML برداشته باشد، `&` به `&amp;` بدل شده و نامِ پارامترها `amp;security`
-# … می‌شوند. نه `dedup_key` و نه `converters.parse_proxy` این را جبران
-# نمی‌کردند؛ سنجشِ زندهٔ خروجی روی هر ۱۰ خطِ آسیب‌دیده نشان داد
-# `tls=False`, `sni=''`, `host=''`, `path=''` و فروریختنِ `network` به `tcp`.
-# یعنی کانفیگ منتشر می‌شد ولی کار نمی‌کرد.
+# Repair `&amp;` when it was an HTML separator.
 #
-# قاعده عامدانه **شرطی** است: تنها جایی `&amp;` به `&` بدل می‌شود که پس از آن
-# یک نامِ پارامترِ معتبر و یک `=` بیاید. اندازه‌گیری روی پیکرهٔ ۱۸٬۷۳۵ خطی:
-# از ۵۵ رخدادِ `&amp;`، هر ۵۵ مورد جداکننده بودند و ۰ مورد غیرِ جداکننده. پس
-# این قاعده روی دادهٔ واقعی بی‌استثنا است و در عینِ حال محافظه‌کارانه می‌ماند:
-# اگر روزی `&amp;` در **مقدارِ** یک پارامتر بیاید، دست‌نخورده رد می‌شود.
+# parse_qs splits on `&`. If a source was copied out of HTML, `&` became `&amp;`
+# and parameter names turned into `amp;security`, etc. Neither dedup_key() nor
+# converters.parse_proxy() repaired this. Live output measurement over all 10
+# affected lines showed `tls=False`, `sni=''`, `host=''`, `path=''` and network
+# collapsing to tcp, i.e. the config was published and did not work.
+#
+# The rule is deliberately conditional: replace `&amp;` only where it is followed by
+# a valid parameter name and `=`. Live corpus measurement: 55/55 `&amp;` instances
+# were separators and 0 were not. So this is complete on real data and still
+# conservative: if `&amp;` ever appears *inside* a parameter value, it is left alone.
 _AMP_SEP = re.compile(r"&amp;(?=[A-Za-z_][A-Za-z0-9_.\-]*=)")
 
 
 def _repair_amp_separator(line: str) -> str:
-    """`&amp;` را فقط در نقشِ **جداکننده** به `&` بازمی‌گرداند."""
+    """Restore `&amp;` to `&` only when it acts as a separator."""
     if "&amp;" not in line:
         return line
     return _AMP_SEP.sub("&", line)
 
-
-# ── ترمیمِ بایت‌های کنترلیِ خام در متنِ کانفیگ ─────────────────────────────────
-# سنجشِ کاملِ پیکرهٔ منتشرشده (۵۰ فایل، ۳۷ مگابایت) نشان داد **یک** کانفیگ
-# حاوی بایت‌های کنترلیِ خام است و همان یک خط، شش بایتِ کنترلی را به سه فایلِ
-# متنی (all/configs.txt, heavy/configs.txt, protocols/shadowsocks.txt) و سه
-# نسخهٔ base64شان تزریق می‌کرد:
+# Repair raw control bytes in config text.
+#
+# A full scan of the published output (50 files, 37 MB) found exactly one config
+# containing raw control bytes, and that one line injected six control bytes into
+# three text files and their three base64 versions:
 #
 #     ss://…@37.32.27.224:9147?prefix=\x16\x03\x01\x00…#IR 🇮🇷 | @Raydikalx | …
 #
-# منشأ: پارامترِ `prefix` در shadowsocks عامدانه بایتِ خام می‌گیرد (اینجا سرآیندِ
-# TLS ClientHello برای obfuscation). یعنی دادهٔ بدخواه نیست؛ اما در یک فایلِ
-# متنیِ منتشرشده بایتِ کنترلیِ خام یک نقصِ یکپارچگی است: NUL می‌تواند رشته را در
-# مصرف‌کنندهٔ C-محور نصف کند و 0x16 در ترمینال/لاگ رفتارِ نامعلوم بسازد.
+# Origin: the `prefix` parameter in shadowsocks intentionally carries raw bytes
+# (here, the start of a TLS ClientHello for obfuscation). Not malicious, but raw
+# control bytes in a published text file are an integrity defect: NUL can truncate
+# a C-based consumer, and 0x16 can confuse terminals/logs.
 #
-# چرا «ترمیم» و نه «حذفِ کانفیگ»؟ اندازه‌گیری نشان داد converterها پارامترِ
-# `prefix` را دور می‌اندازند، پس همین نود در clash.yaml و singbox.json **حاضر و
-# سالم** است. حذفِ خط، نودی را از خروجی کم می‌کرد که امروز منتشر می‌شود.
+# Repair, not delete: measurement showed the converters ignore `prefix`, so the
+# same node is present and healthy in clash.yaml and singbox.json. Deleting the
+# line would remove a node the repo publishes today.
 #
-# قاعده عامدانه **دو-ناحیه‌ای** است:
-#   • در `query` و `fragment` → percent-encoding (بی‌اتلاف و idempotent؛
-#     RFC 3986 §2.1 همین را برای بایتِ غیرمجاز تجویز می‌کند و کلاینت با
-#     unquote دقیقاً همان بایتِ اصلی را بازمی‌سازد ⇒ کانفیگ کار می‌کند).
-#   • پیش از `?` (scheme/authority) → خط **دور انداخته می‌شود**؛ بایتِ کنترلی
-#     در میزبان/پورت یعنی خطِ خراب است و percent-encoding آن را «قابلِ قبول»
-#     جلوه می‌دهد بی‌آنکه سالم کند.
+# The rule is deliberately two-zone:
+#   - in query and fragment -> percent-encode, lossless and idempotent. RFC 3986
+#     recommends exactly that for a non-legal byte, and the client reconstructs the
+#     original byte with unquote, so the config still works.
+#   - before `?` (scheme/authority) -> drop the line entirely. A control byte in the
+#     host or port means the line is broken; percent-encoding it would only make it
+#     *look* acceptable.
 #
-# دو سنجشِ مستقل روی پیکرهٔ **واقعیِ** منتشرشده. پیکره هر ۱۵ دقیقه از نو ساخته
-# می‌شود، پس تعدادِ خط عددِ ثابتی نیست و عامداً هر دو اندازه‌گیری با تاریخ ثبت
-# شده تا بازبینی‌پذیر باشد (نسبت‌ها بازتولید می‌شوند، نه عددِ خام):
-#   • ۲۰۲۶-۰۸-۰۱، پیکرهٔ ۱۰٬۰۹۱ خطی → ۱۰٬۰۹۰ بی‌تغییر، ۱ ترمیم، ۰ حذف
-#   • ۲۰۲۶-۰۸-۰۱، بازسنجیِ زنده روی پیکرهٔ ۱۰٬۰۱۹ خطی، این بار با فراخوانیِ
-#     خودِ همین پیاده‌سازی (نه شبیه‌سازی) → ۱۰٬۰۱۸ بی‌تغییر، ۱ ترمیم، ۰ حذف
-# در هر دو سنجش `dedup_key` و `stable_label` پیش و پس از ترمیم یکسان ماندند و
-# خروجیِ clash/sing-box بایت‌به‌بایت تغییر نکرد ⇒ صفر ریزشِ قابلِ مشاهده.
+# Two independent measurements on real published corpora, intentionally dated
+# because the repo rebuilds every 15 minutes:
+#   - 2026-08-01, 10,091-line corpus -> 10,090 unchanged, 1 repaired, 0 dropped
+#   - 2026-08-01, live re-run of this very implementation on a 10,019-line corpus
+#     -> 10,018 unchanged, 1 repaired, 0 dropped
+# In both, dedup_key() and stable_label() stayed the same before/after the repair,
+# and Clash/sing-box output was byte-for-byte unchanged.
 _CTRL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def _pct_encode_ctrl(text: str) -> str:
-    """هر بایتِ کنترلی را به شکلِ `%XX` (RFC 3986) بازنویسی می‌کند."""
+    """Percent-encode every control byte as %XX (RFC 3986)."""
     return _CTRL_CHAR_RE.sub(lambda m: "%%%02X" % ord(m.group(0)), text)
 
 
 def _repair_control_chars(line: str) -> str:
-    """بایتِ کنترلیِ خام را در `query`/`fragment` percent-encode می‌کند.
+    """Percent-encode raw control bytes in query/fragment.
 
-    اگر بایتِ کنترلی **پیش از** `?` باشد، رشتهٔ خالی برمی‌گرداند تا فراخوان
-    خط را دور بیندازد (رفتارِ fail-safe؛ در `extract_valid_lines` همین رشتهٔ
-    خالی باعثِ short-circuit و حذفِ خط می‌شود).
+    If a control byte appears *before* `?`, return the empty string so the caller
+    drops the line. extract_valid_lines() short-circuits on that empty string.
     """
     if not _CTRL_CHAR_RE.search(line):
         return line
@@ -1479,95 +1255,73 @@ def _repair_control_chars(line: str) -> str:
         repaired += frag_sep + _pct_encode_ctrl(frag)
     return repaired
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 🩹 نرمال‌سازیِ `packetEncoding` — سازگاریِ Hiddify / sing-box
-# ══════════════════════════════════════════════════════════════════════════════
-# گزارشِ میدانیِ مالکِ مخزن: افزودنِ اشتراکِ `top100` در Hiddify (آخرین نسخه) با
-# خطای «failed to start background core» شکست می‌خورد. علت با اجرای **خودِ هستهٔ
-# رسمی** (hiddify-core v4.1.0، همان باینریِ داخلِ اپ) روی پیکرهٔ منتشرشده
-# ایزوله شد و به **یک مقدارِ پارامتر** رسید: `packetEncoding=none`.
+# packetEncoding normalisation for Hiddify / sing-box compatibility.
 #
-# زنجیرهٔ علت، خط‌به‌خط از منبعِ پین‌شده (نه از حافظه):
+# The owner's field report was that importing top100 into the latest Hiddify fails
+# with "failed to start background core". That was isolated by running the *official
+# hiddify-core* on the live published corpus and pinned to one parameter value:
+# packetEncoding=none.
 #
-#   ۱) `ray2sing/url_schema.go::ParseUrl` کلیدِ کوئری را نرمال می‌کند:
-#          data.Params[strings.ReplaceAll(strings.ToLower(key), "_", "")] = ...
-#      یعنی **کلید** case-insensitive و بی‌`_` می‌شود، ولی **مقدار** عیناً و
-#      حساس‌به‌حروف می‌ماند.
-#   ۲) `ray2sing/vless.go:30-32`:
-#          packetEncoding := decoded["packetencoding"]
-#          if packetEncoding == "" { packetEncoding = "xudp" }
-#      و سپس `PacketEncoding: &packetEncoding` — یک **اشاره‌گر**.
-#   ۳) `hiddify-sing-box/protocol/vless/outbound.go:76-88`:
-#          nil → xudp ، "" → هیچ‌کدام ، "packetaddr" ، "xudp" ،
-#          default → E.New("unknown packet encoding: ", options.PacketEncoding)
-#      و چون آرگومان یک `*string` است، `sing/common/format.ToString` به‌جای
-#      چاپِ مقدار **panic: unknown value** می‌دهد.
-#   ۴) `v2/config/parser.go::parseConfigContent` در پایانِ هر مسیر
-#      `libbox.CheckConfigOptions(options)` را روی **کلِ** پروفایل صدا می‌زند.
-#      پس یک خطِ بد، تمامِ اشتراک را ساقط می‌کند (اثباتِ اجرایی: ۱ کانفیگ سالم
-#      + ۱ کانفیگ بد ⇒ شکستِ کامل).
+# The exact chain, from the pinned source:
+#   1. ray2sing/url_schema.go::ParseUrl normalises the *key* by lowercasing and
+#      removing `_`, but leaves the *value* case sensitive.
+#   2. ray2sing/vless.go reads decoded["packetencoding"] and defaults the empty
+#      string to "xudp", then stores a *pointer* to that string.
+#   3. hiddify-sing-box/protocol/vless/outbound.go accepts nil, "", "packetaddr"
+#      and "xudp", and errors on anything else. Because the value is a *string
+#      pointer*, format.ToString panics with "unknown value" instead of just
+#      printing the string.
+#   4. config/parser.go checks the *entire* profile, so one bad line burns the
+#      whole subscription. That was proven live: 1 good config + 1 bad config ->
+#      total failure.
 #
-# نتیجهٔ مهم: مقدارِ `none` (که در Xray به‌معنای «بدون xudp» است) در sing-box
-# اصلاً وجود ندارد؛ معادلِ معناییِ آن رشتهٔ تهی است، و آن هم به‌خاطر بندِ ۲ از
-# مسیرِ URL **دست‌نیافتنی** است. یعنی تنها مقادیرِ عملاً پذیرفتنی از راهِ لینک،
-# دقیقاً `xudp` و `packetaddr` هستند و بس.
+# Crucial conclusion: `none`, which means "no xudp" in Xray, simply does not exist
+# in sing-box. The semantic equivalent would be an empty string, and because of
+# step 2 that is unreachable via the URL path. So the only values actually accepted
+# through a link are exactly xudp and packetaddr.
 #
-# چرا «حذفِ پارامتر» و نه «تبدیل به xudp»؟ حذف، رفتارِ پیش‌فرضِ ray2sing را
-# فعال می‌کند که خودش `xudp` است (vless.go:31) ⇒ همان نتیجه، ولی بدونِ آنکه ما
-# مقداری را به کانفیگِ منبع **تحمیل** کنیم؛ اگر روزی ray2sing پیش‌فرض را عوض
-# کند، خروجیِ ما همچنان «سکوت» است نه «ادعای اشتباه».
+# Why remove the parameter instead of rewriting it to xudp? Deleting it activates
+# ray2sing's own default, which is xudp, so the outcome is the same but we do not
+# impose a value onto the source config. If ray2sing ever changes its default, our
+# output stays "silence" rather than becoming "the wrong claim".
 #
-# اثباتِ صفر-پس‌رفت برای سایرِ کلاینت‌ها (خواندنِ مستقیمِ منبع، نه حدس):
-#   • v2rayNG (`VlessFmt.kt`, `FmtBase.kt`, `CoreConfigManager.kt`) → صفر رخدادِ
-#     `packetEncoding`/`xudp`/`packetaddr`؛ فهرستِ کاملِ پارامترهایی که می‌خوانَد
-#     این پارامتر را ندارد.
-#   • v2rayN (`ServiceLib/Handler/Fmt/BaseFmt.cs`) → صفر رخداد.
-#   • mihomo (`common/convert/converter.go`) → صفر رخدادِ `packet`.
-#   پس این پارامتر برای همهٔ خانواده‌های دیگرِ کلاینت **بی‌اثر** است و حذفش
-#   هیچ قابلیتی را از هیچ کاربری نمی‌گیرد.
+# Zero regression for other clients was verified by reading their source directly:
+# v2rayNG, v2rayN and mihomo have zero references to packetEncoding/xudp/
+# packetaddr, so removing it costs nobody anything.
 #
-# اندازه‌گیریِ زنده (۲۰۲۶-۰۸-۰۲، پیکرهٔ ۱۰٬۷۲۸ خطیِ `all/configs.txt`):
-#   • `packetEncoding=xudp` → ۱۲۴ خط  ⇒ دست‌نخورده می‌مانند (پشتیبانی‌شده)
-#   • `packetEncoding=none` → ۲۷ خط   ⇒ پارامتر حذف می‌شود
-#   • هیچ املای دیگری (`packet_encoding`, `PacketEncoding`, …) دیده نشد.
-#   • در ۳٬۲۵۷ خطِ `vmess://`، صفر شیء JSON کلیدِ `packetEncoding` داشت ⇒ شاخهٔ
-#     vmess امروز کاملاً **خاموش** است و صفر churn تولید می‌کند؛ عامدانه
-#     پیاده‌سازی شده چون sing-box همان اعتبارسنجی را برای vmess هم دارد
-#     (`protocol/vmess/outbound.go:74-82`) و آنجا `PacketEncoding` یک `string`
-#     ساده است ⇒ خطا به‌جای panic، ولی باز هم کلِ پروفایل را ساقط می‌کند.
-#   • جست‌وجوی ایستا در کلِ ray2sing نشان داد تنها دو نقطه این پارامتر را
-#     می‌خوانند: `vless.go:30` (کلیدِ نرمال‌شدهٔ کوئری) و `vmess.go:61` (کلیدِ
-#     عیناً camelCase از دلِ JSON). در `xrayvless/xrayvmess/xraytrojan/xraydirect`
-#     همهٔ ارجاع‌ها **کامنت** شده‌اند. پس دامنهٔ این تابع دقیقاً همین دو است.
-
-#: تنها مقادیری که sing-box از راهِ لینک می‌پذیرد. `""` عمداً اینجا نیست: از
-#: مسیرِ URL دست‌نیافتنی است (ray2sing تهی را به `xudp` بدل می‌کند).
+# Live measurement (2026-08-02, 10,728 lines in all/configs.txt):
+#   - packetEncoding=xudp -> 124 lines, kept unchanged
+#   - packetEncoding=none -> 27 lines, parameter removed
+#   - no alternate spellings were seen in the wild
+#   - among 3,257 vmess:// lines, zero JSON objects carried packetEncoding -> the
+#     vmess branch is totally dormant today and produces zero churn, but exists
+#     deliberately because sing-box validates vmess the same way.
 _PACKET_ENCODING_SUPPORTED = frozenset({"xudp", "packetaddr"})
 
-#: یک `%` که پس از آن دو رقمِ hex نیاید ⇒ `net/url.QueryUnescape` خطا می‌دهد و
-#: Go آن جفت را **کاملاً نادیده** می‌گیرد. برای هم‌رفتاریِ دقیق شبیه‌سازی شده.
+#: A `%` not followed by two hex digits: Go's net/url.QueryUnescape errors there
+#: and the pair is dropped entirely. This regex reproduces that exactly.
 _BAD_PCT_ESCAPE_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
 
 def _go_query_unescape(text: str) -> Optional[str]:
-    """معادلِ `net/url.QueryUnescape`؛ در escapeٔ نامعتبر `None` می‌دهد."""
+    """Equivalent of net/url.QueryUnescape, returning None on a bad escape."""
     if _BAD_PCT_ESCAPE_RE.search(text):
         return None
     return urllib.parse.unquote_plus(text)
 
 
 def _strip_vless_packet_encoding(line: str) -> str:
-    """پارامترِ `packetEncoding` را از کوئریِ vless حذف می‌کند اگر نامعتبر باشد.
+    """Drop a vless packetEncoding query param if it is not accepted.
 
-    شبیه‌سازیِ دقیقِ `net/url.ParseQuery` + نرمال‌سازیِ کلیدِ ray2sing:
-      • جداکننده فقط `&` است؛ جفتی که `;` داشته باشد در Go رد می‌شود.
-      • کلید و مقدار percent-decode می‌شوند (`+` → فاصله).
-      • کلید lower و بدونِ `_` مقایسه می‌شود؛ مقدار عیناً.
-      • چند مقدار برای **یک کلیدِ یکسان** با `,` به‌هم می‌چسبند.
-    پارامتر تنها وقتی نگه داشته می‌شود که هر گروهِ کلیدِ نظیر، مقدارِ مؤثرش
-    دقیقاً یکی از مقادیرِ پشتیبانی‌شده باشد؛ در غیرِ این‌صورت **همهٔ** رخدادها
-    حذف می‌شوند (رفتارِ قطعی، حتی وقتی Go ترتیبِ map را تصادفی می‌پیماید).
+    This follows net/url.ParseQuery plus ray2sing's key normalisation exactly:
+      - only `&` separates pairs; any pair containing `;` is dropped by Go
+      - key and value are percent-decoded (`+` -> space)
+      - the key is compared lowercased and with `_` removed; the value is exact
+      - multiple values for the *same* key are joined with `,`
+
+    The parameter is kept only when every equal-key group resolves to one of the
+    supported values. Otherwise *all* occurrences are removed, making the outcome
+    deterministic even though Go iterates maps in random order.
     """
     head, frag_sep, frag = line.partition("#")
     base, query_sep, query = head.partition("?")
@@ -1578,12 +1332,12 @@ def _strip_vless_packet_encoding(line: str) -> str:
     groups: Dict[str, List[str]] = {}
     for i, pair in enumerate(pairs):
         if not pair or ";" in pair:
-            continue  # Go: جفتِ تهی/دارای `;` نادیده گرفته می‌شود
+            continue  # Go ignores empty pairs and any pair containing `;`
         raw_key, _eq, raw_val = pair.partition("=")
         key = _go_query_unescape(raw_key)
         val = _go_query_unescape(raw_val)
         if key is None or val is None:
-            continue  # Go: خطای unescape ⇒ جفت اصلاً وارد map نمی‌شود
+            continue  # bad unescape: the pair never reaches the map in Go either
         if key.lower().replace("_", "") != "packetencoding":
             continue
         hits.append(i)
@@ -1593,7 +1347,7 @@ def _strip_vless_packet_encoding(line: str) -> str:
     if all(",".join(vals) in _PACKET_ENCODING_SUPPORTED for vals in groups.values()):
         return line
     drop = set(hits)
-    kept = [p for i, p in enumerate(pairs) if i not in drop]
+    kept = [pair for i, pair in enumerate(pairs) if i not in drop]
     new_query = "&".join(kept)
     rebuilt = base + ("?" + new_query if new_query else "")
     if frag_sep:
@@ -1602,19 +1356,18 @@ def _strip_vless_packet_encoding(line: str) -> str:
 
 
 def _strip_vmess_packet_encoding(line: str) -> str:
-    """کلیدِ `packetEncoding` را از JSONِ vmess حذف می‌کند اگر نامعتبر باشد.
+    """Drop the vmess JSON key `packetEncoding` when the value is unsupported.
 
-    `ray2sing/vmess.go:61` این کلید را **عیناً** (camelCase) از شیء JSON
-    می‌خوانَد و `convertToStrings` هر مقدارِ غیررشته‌ای را با `fmt.Sprintf("%v")`
-    به متن بدل می‌کند (مثلاً `null` → `<nil>`). پس تنها رشتهٔ دقیقِ `xudp` یا
-    `packetaddr` بی‌خطر است.
+    ray2sing/vmess.go reads this key *exactly* in camelCase, and convertToStrings
+    turns any non-string into text via fmt.Sprintf (e.g. null -> <nil>). So only
+    the exact strings xudp and packetaddr are safe.
     """
-    b64 = line[8:].split("#")[0].strip()
-    if not b64:
+    body = line[8:].split("#")[0].strip()
+    if not body:
         return line
     try:
-        txt = decode_base64_text(b64)
-        obj = json.loads(txt) if txt is not None else None
+        text = decode_base64_text(body)
+        obj = json.loads(text) if text is not None else None
     except Exception:
         return line
     if not isinstance(obj, dict) or "packetEncoding" not in obj:
@@ -1634,7 +1387,10 @@ def _strip_vmess_packet_encoding(line: str) -> str:
 
 
 def _normalize_packet_encoding(line: str) -> str:
-    """`packetEncoding`ِ نامعتبر را از vless/vmess برمی‌دارد (بی‌اثر برای بقیه)."""
+    """Remove packetEncoding that sing-box/Hiddify cannot accept.
+
+    Effective only for vless/vmess; all other schemes pass through unchanged.
+    """
     if not line:
         return line
     scheme = line[:8].lower()
@@ -1646,7 +1402,7 @@ def _normalize_packet_encoding(line: str) -> str:
 
 
 def extract_valid_lines(content: str) -> List[str]:
-    """از یک blob (direct یا base64) خطوط کانفیگ معتبر را استخراج می‌کند."""
+    """Extract valid config lines from one blob, direct or base64."""
     if not content:
         return []
     first_real = next(
@@ -1654,17 +1410,17 @@ def extract_valid_lines(content: str) -> List[str]:
          if ln.strip() and not ln.strip().startswith("//") and not ln.strip().startswith("#")),
         "",
     )
-    # اگر اولین خطِ واقعی، کانفیگِ پروکسی نبود → احتمالاً blob base64 است
+    # If the first real line is not a proxy config, the blob is probably base64.
     if not is_proxy_config(first_real):
         decoded = try_base64_decode(content)
         if decoded:
             content = decoded
-    # هوشمند: هر scheme:// معتبر پذیرفته می‌شود (حتی پروتکل‌های جدید)
-    # ترتیب عامدانه است: نخست نرمال‌سازیِ `&amp;` (تا کلیدهای کوئری واقعاً کلید
-    # شوند)، سپس ترمیمِ بایتِ کنترلی، و در پایان نرمال‌سازیِ `packetEncoding` که
-    # روی کوئریِ **تمیزشده** کار می‌کند. پس از sanitizer هیچ مرحله‌ای بایتِ کنترلی
-    # بازنمی‌گرداند ⇒ هر خطی که از این تابع بیرون می‌آید، تضمیناً بدونِ بایتِ
-    # کنترلیِ خام است و `packetEncoding`ِ ساقط‌کنندهٔ sing-box هم ندارد.
+    # Smart: any valid scheme:// is accepted, even future protocols.
+    # The order is deliberate: repair `&amp;` first so query keys really become
+    # keys, then repair control bytes, and only then normalise packetEncoding over
+    # the cleaned query. No later step can reintroduce raw control bytes, so every
+    # line leaving this function is guaranteed to contain none and no
+    # packetEncoding value that sinks sing-box.
     return [
         line for raw in content.splitlines()
         if (line := _normalize_packet_encoding(
@@ -1672,57 +1428,39 @@ def extract_valid_lines(content: str) -> List[str]:
         and is_proxy_config(line)
     ]
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 🛡️ سپرِ `#` — جلوگیری از «بلعیده‌شدنِ» خطوطِ ناشناخته توسطِ ray2sing
-# ══════════════════════════════════════════════════════════════════════════════
-# Hiddify اشتراکِ متنی را خط‌به‌خط نمی‌خوانَد؛ `ray2sing/spliter.go` نخست یک
-# regexِ `(?m)^(?:<prefixes>)` می‌سازد و متن را از هر prefix تا prefixِ **بعدی**
-# تکه می‌کند (`splitByPrefix`). پیامدِ مستقیم: خطی که با هیچ prefixِ شناخته‌شده
-# شروع نشود، «خطِ جدا» نیست — به تکهٔ **قبلی** می‌چسبد و چون تکهٔ قبلی یک URL
-# است، آن متن داخلِ fragment (نامِ نود) می‌نشیند.
+# `#` shield against ray2sing swallowing unsupported schemes.
 #
-# اثباتِ اجراییِ A/B با خودِ هستهٔ رسمی (v4.1.0) روی دادهٔ زنده: در حضورِ یک
-# دنبالهٔ `ssr://`، تگِ نودِ درست پیش از آن به این شکل درآمد —
-#     "US 🇺🇸 | @Raydikalx | D50052\nssr://MTIw…#CN 🇨🇳 … § 0"
-# یعنی نامِ یک نودِ سالم با کلِ متنِ چند خطِ ssr آلوده شد (خروجی exit 0 بود، پس
-# این نقص **خاموش** است و بدونِ اجرای هسته دیده نمی‌شد).
+# Hiddify does not read text subscriptions line by line. ray2sing first builds one
+# regex from every known prefix and splits the whole body from one prefix to the
+# *next*. Consequence: a line that starts with no known prefix is not its own line,
+# it sticks to the *previous* chunk and, because the previous chunk is a URL, lands
+# inside its fragment (the node name).
 #
-# چرا `ssr://`؟ مجموعهٔ prefixها در `spliter.go::buildRegex()` دقیقاً اجتماعِ
-# `configTypes` ∪ `endpointParsers` ∪ `xrayConfigTypes` ∪ {"#", "//"} است و
-# `ssr://` در هیچ‌کدام نیست (sing-box از نسخهٔ ۱.۶.۰ ShadowsocksR را حذف کرده).
-# توجه: `ss://` هم آن را نجات نمی‌دهد، چون تطبیق روی متنِ عینی است و
-# `"ssr:"` ≠ `"ss:/"`.
+# A/B with the official core reproduced the failure on live data: when an ssr://
+# run was present, the tag of the correct node right before it became:
+#   "US 🇺🇸 | @Raydikalx | D50052\nssr://MTIw…#CN 🇨🇳 … § 0"
+# i.e. the name of one healthy node was contaminated with several whole ssr lines.
+# The output still exited 0, so this is a *silent* defect.
 #
-# راهِ حل — و این کشفِ کلیدیِ همین بررسی است: خودِ `#` یک prefix است و
-# `expandDecodedConfig::add()` هر تکه‌ای را که با `#` یا `/` شروع شود **دور
-# می‌اندازد**. پس یک خطِ `#` بلافاصله پیش از هر دنبالهٔ ناشناخته، کلِ آن دنباله
-# را به یک تکهٔ دورانداختنی تبدیل می‌کند: نه تگی آلوده می‌شود، نه نودی از دست
-# می‌رود (آن نودها از ابتدا هم برای Hiddify قابلِ استفاده نبودند).
+# Why ssr://: the prefix set in ray2sing is exactly the union of configTypes,
+# endpointParsers, xrayConfigTypes, plus {"#", "//"}, and ssr:// is in none of
+# them because sing-box removed ShadowsocksR in 1.6.0.
 #
-# اثباتِ صفر-پس‌رفت برای بقیهٔ کلاینت‌ها (خواندنِ مستقیمِ منبع):
-#   • v2rayNG `AngConfigManager.parseBatchConfig` →
-#     `servers.lines().distinct().reversed().forEach { parseConfig(it) }`
-#     و `parseConfig` با `configFmtParsers.firstNotNullOfOrNull { … startsWith }`
-#     خطِ ناشناخته را `null` می‌کند ⇒ رد می‌شود، بدونِ اثر بر خطوطِ مجاور.
-#   • v2rayN `ConfigHandler.AddBatchServersCommon` →
-#     `strData.Split(NewLine)…foreach`، و `FmtHandler.ResolveConfig(str)` برای
-#     خطِ ناشناخته `null` می‌دهد ⇒ `continue`.
-#   • mihomo `convert.ConvertsV2Ray` → `strings.Cut(line, "://")`؛ خطِ `#`
-#     جداکنندهٔ `://` ندارد ⇒ `continue`.
-#   هر سه **خط‌به‌خط**اند، پس افزودنِ یک خطِ `#` برایشان کاملاً بی‌اثر است.
-#   به همین دلیل متنِ سپر عامدانه هیچ `://`ای ندارد.
+# The crucial fix: `#` itself is a known prefix, and expandDecodedConfig::add()
+# throws away any chunk that starts with `#` or `//`. So one `#` line immediately
+# before any run of unknown lines turns the whole run into a disposable chunk. No
+# tag gets contaminated, no healthy node is lost, and those unknown nodes were
+# unusable for Hiddify already.
 #
-# اندازه‌گیریِ زنده (۲۰۲۶-۰۸-۰۲): تنها یک scheme خارج از مجموعهٔ prefix در کلِ
-# خروجیِ منتشرشده دیده شد — `ssr://` با ۲۸ خط در `all`، ۲۴ در `heavy`، ۴ در
-# `light` و ۲۸ در `protocols/shadowsocksr.txt`. بقیهٔ ۳۵٬۳۱۶ خط همگی prefixِ
-# شناخته‌شده داشتند. قاعده با این حال **عمومی** نوشته شده (بر پایهٔ مجموعهٔ
-# prefix، نه فهرستِ سیاهِ `ssr`) تا اگر فردا منبعی scheme تازه‌ای بیاورد،
-# خودکار پوشش داده شود.
-
-#: مجموعهٔ prefixهای `ray2sing` — عیناً از منبعِ پین‌شده
-#: (`ray2sing/convert.go` @ f58be84: configTypes + endpointParsers +
-#: xrayConfigTypes). مقایسه مثلِ خودِ regex **حساس به حروف** است.
+# Zero regression for other clients was proven from source: v2rayNG, v2rayN and
+# mihomo all read line by line, so an extra `#` line is inert. The shield text
+# therefore deliberately contains no `://` of its own.
+#
+# Live measurement: only one scheme outside ray2sing's prefix set appears anywhere
+# in the published output, ssr://, with 28 lines in all, 24 in heavy, 4 in light
+# and 28 in protocols/shadowsocksr.txt. The rule is still written generically from
+# the prefix set, not as a black-list of ssr, so a new future scheme is covered
+# automatically.
 RAY2SING_PREFIXES = frozenset({
     "vmess://", "vless://", "trojan://", "svmess://", "svless://", "strojan://",
     "ss://", "tuic://", "hysteria://", "hysteria2://", "hy2://", "ssh://",
@@ -1732,40 +1470,38 @@ RAY2SING_PREFIXES = frozenset({
     "wg://", "wireguard://", "warp://", "awg://", "[Interface]",
 })
 
-#: خطِ سپر. عامدانه بدونِ `://` تا هیچ کلاینتی آن را URL نبیند، و با متنِ
-#: خوانا تا کاربری که فایل را باز می‌کند بداند چرا اینجاست.
+#: One reusable shield line. Deliberately no `://`, so no client mistakes it for a
+#: URL, and readable enough that someone opening the file understands why it exists.
 SHIELD_LINE = "# --- below: schemes sing-box cannot parse (skipped by Hiddify) ---"
 
-
-#: همان مجموعه به شکلِ tuple — `str.startswith` روی tuple در C اجرا می‌شود و
-#: روی پیکرهٔ ده‌هزار خطی محسوس است.
+#: Same set as a tuple because str.startswith(tuple) runs in C and matters on
+#: 10k-line corpora.
 _RAY2SING_PREFIX_TUPLE = tuple(sorted(RAY2SING_PREFIXES))
 
 
 def is_ray2sing_prefixed(line: str) -> bool:
-    """آیا این خط با یکی از prefixهای شناخته‌شدهٔ ray2sing شروع می‌شود؟"""
+    """Whether this line starts with a prefix ray2sing knows."""
     return line.startswith(_RAY2SING_PREFIX_TUPLE)
 
 
 def _is_shield(line: str) -> bool:
-    """آیا این خط خودش یک «تکهٔ دورانداختنی» است؟ (`#` یا `//` — spliter.go)"""
+    """Whether this line is itself a disposable ray2sing chunk, # or //."""
     return line.startswith("#") or line.startswith("//")
 
 
 def shield_unsupported_runs(lines: List[str]) -> List[str]:
-    """پیش از هر دنبالهٔ خطوطِ خارج از prefixهای ray2sing یک خطِ `#` می‌گذارد.
+    """Insert one `#` line before each run of lines outside ray2sing's prefixes.
 
-    تابع **idempotent** است: اگر خطِ پیشین از قبل `#`/`//` باشد (مثلاً سرآیندِ
-    فایل یا سپرِ قبلی)، سپرِ تازه‌ای اضافه نمی‌شود. پس فراخوانیِ دوباره روی
-    خروجیِ خودش، خروجی را عوض نمی‌کند.
+    Idempotent: if the previous line is already `#` or `//`, whether a header or an
+    earlier shield, no fresh shield is added. Running it again on its own output
+    leaves the output unchanged.
     """
     out: List[str] = []
     prev_is_shield = False
     for line in lines:
         if not line.strip():
-            # خطِ تهی در ray2sing به‌عنوانِ فضای خالیِ انتهای تکهٔ قبلی
-            # `TrimSpace` می‌شود ⇒ بی‌اثر است و نه سپر می‌خواهد نه دنباله را
-            # می‌شکند.
+            # Blank lines are trimmed into the preceding ray2sing chunk and are
+            # inert; they need no shield and do not break a run.
             out.append(line)
             continue
         if _is_shield(line):
@@ -1780,70 +1516,65 @@ def shield_unsupported_runs(lines: List[str]) -> List[str]:
 
 
 def encode_base64_subscription(lines: List[str], header: str = "") -> str:
-    """لیست کانفیگ‌ها → بلوک base64 استاندارد اشتراک (v2rayN/v2rayNG).
+    """Config list -> the standard base64 subscription payload.
 
-    سپرِ `#` **داخلِ** همین تابع اعمال می‌شود تا نسخهٔ base64 هرگز نتواند از
-    نسخهٔ متنی واگرا شود؛ چون idempotent است، فراخوان می‌تواند بی‌خطر خودش هم
-    `shield_unsupported_runs` را صدا زده باشد.
+    The shield is applied *inside* this function so the base64 version cannot
+    diverge from the text version. Because it is idempotent, callers can safely
+    have applied shield_unsupported_runs already.
 
-    `header` (اختیاری) **پیش از** رمزگذاری به متن چسبانده می‌شود، نه بعد از آن.
-    دلیلش سنجیده است: Hiddify در `parseHeadersFromContent` نخست
-    `safeDecodeBase64` را صدا می‌زند، پس سرآیند باید **درونِ** payload باشد تا
-    دیده شود؛ سرآیندِ بیرونِ base64 هم دیده نمی‌شود و هم خودِ payload را برای
-    کلاینت‌هایی که کلِ بدنه را یک‌جا decode می‌کنند خراب می‌کند.
-    پیش‌فرضِ `""` سازگاریِ عقب‌رو را حفظ می‌کند.
+    `header` is prepended *before* encoding, not after. Measured reason: Hiddify's
+    parseHeadersFromContent first base64-decodes, so the header must live *inside*
+    the payload to be seen. A header outside the base64 is both invisible and can
+    break the payload for clients that decode the whole response in one shot.
     """
     joined = "\n".join(shield_unsupported_runs(lines))
     return base64.b64encode((header + joined).encode("utf-8")).decode("ascii")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 🛡️ گاردِ خروجی — دفاعِ لایه‌دوم در برابرِ بایتِ کنترلی
-# ══════════════════════════════════════════════════════════════════════════════
-# `_repair_control_chars` نقص را در **ورودی** می‌بندد. این گارد همان تضمین را
-# در **خروجی** تکرار می‌کند تا اگر روزی مسیرِ سومی (سرآیند، برچسب، متنِ تولیدی)
-# بایتِ کنترلی بسازد، به‌جای انتشارِ خاموش، بلند شکست بخورد.
+# Output guard against raw control bytes.
 #
-# چرا fail-closed (استثنا) و نه پاک‌سازیِ خاموش؟ در این مخزن، شکستِ aggregate
-# یعنی مرحلهٔ publish اجرا نمی‌شود و آخرین خروجیِ **سالمِ** قبلی روی main
-# می‌مانَد. پس بدترین پیامدِ این گارد «کهنگیِ داده + یک اجرای سرخِ کاملاً
-# دیدنی» است، نه انتشارِ دادهٔ خراب. اولویتِ درستی بر تازگی، انتخابِ آگاهانه.
+# _repair_control_chars() closes the defect in *input*. This guard repeats the same
+# guarantee on *output*: if a third path, header, label or generated text ever
+# creates a control byte, publication fails loudly instead of shipping it silently.
 #
-# چرا هر بایتِ C0 جز LF ممنوع است (و صفر مثبتِ کاذب می‌دهد) — سه اندازه‌گیریِ
-# مستقل و هم‌سو:
-#   ۱) سنجشِ کلِ جمعیتِ خروجیِ واقعیِ منتشرشده: TAB=۰، CR=۰، DEL=۰ در همهٔ
-#      فایل‌ها؛ تنها بایتِ کنترلیِ مجاز، LF بود.
-#   ۲) بررسیِ ایستا: تنها `\t`/`\r` در کلِ ماژول‌های نویسنده در
-#      `_FRONT_HOST_BAD_CHARS` است که مجموعهٔ **ردّ** است، نه متنِ نوشتنی؛
-#      سرآیندها هم فقط `#`, متن و LF دارند.
-#   ۳) معناشناسیِ serializerها: `json.dumps` و `yaml.dump` هر بایتِ C0 را
-#      escape می‌کنند (آزمونِ زنده: `\x16`, `\t`, `\r` هر سه به شکلِ متنی
-#      درآمدند) ⇒ clash.yaml و singbox.json ساختاراً نمی‌توانند بایتِ خام
-#      داشته باشند. پس `.json`/`.yaml` نیز بی‌خطر از این گارد می‌گذرند.
-#   و base64 فقط الفبای ASCII تولید می‌کند.
+# Fail-closed is deliberate. In this repo, an aggregate failure means the publish
+# step never runs and the last healthy output stays on main. The worst outcome is
+# stale data plus one very visible red run, not bad data going live. Correctness
+# beats freshness here.
 #
-# نتیجه: در کارکردِ عادی این گارد هرگز شلیک نمی‌کند؛ یک assertion است، نه فیلتر.
-
-
+# Why every C0 byte except LF is forbidden, with zero false positives by
+# measurement:
+#   1. live scan of the full published output: TAB=0, CR=0, DEL=0 everywhere. The
+#      only legal control byte in normal output was LF.
+#   2. static scan: the only \t/\r in the writer modules live inside a *rejecting*
+#      set `_FRONT_HOST_BAD_CHARS`, not in writable text. Headers contain only `#`,
+#      text and LF.
+#   3. serializer semantics: json.dumps and yaml.dump escape every C0 byte. Live
+#      check on \x16, \t and \r: all three became textual escapes. So clash.yaml and
+#      singbox.json structurally cannot contain raw control bytes. Base64 also only
+#      outputs ASCII.
+#
+# Result: in normal operation this guard never fires. It is an assertion, not a
+# filter.
 class ControlByteInOutput(ValueError):
-    """خروجی حاوی بایتِ کنترلیِ خام است — انتشار باید متوقف شود."""
+    """Output contains a forbidden raw control byte, publication must stop."""
 
 
-#: هر بایتِ C0 جز `\n`، به‌علاوهٔ DEL. عامدانه TAB و CR را هم شامل می‌شود:
-#: نبودشان اندازه‌گیری شده و حضورشان یعنی آلودگیِ CRLF یا سرآیندِ ناخواسته.
+#: Every C0 byte except `\n`, plus DEL. TAB and CR are included on purpose:
+#: measurement showed they never occur, and their presence would mean CRLF or an
+#: unintended header leak.
 _FORBIDDEN_OUTPUT_CHAR_RE = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")
 
 
 def assert_no_control_bytes(path: str, content: str) -> None:
-    """اگر `content` بایتِ کنترلیِ ممنوع داشته باشد، استثنا می‌اندازد.
+    """Raise when `content` contains a forbidden control byte.
 
-    پیامِ خطا عامدانه «قابلِ اقدام» است: مسیر، بایت، شمارهٔ خط و ستون، و یک
-    نمونهٔ کوتاه که با `repr` نمایش داده می‌شود تا خودِ لاگ آلوده نشود.
+    The error message is intentionally actionable: path, byte, line and column, plus
+    a short repr() excerpt so the log itself is not polluted.
     """
-    m = _FORBIDDEN_OUTPUT_CHAR_RE.search(content)
-    if m is None:
+    match = _FORBIDDEN_OUTPUT_CHAR_RE.search(content)
+    if match is None:
         return
-    offset = m.start()
+    offset = match.start()
     line_no = content.count("\n", 0, offset) + 1
     line_start = content.rfind("\n", 0, offset) + 1
     column = offset - line_start + 1
@@ -1851,7 +1582,7 @@ def assert_no_control_bytes(path: str, content: str) -> None:
     excerpt = content[max(line_start, offset - 40):offset + 40]
     raise ControlByteInOutput(
         f"refusing to write {path!r}: forbidden control byte "
-        f"0x{ord(m.group(0)):02X} at line {line_no}, column {column} "
+        f"0x{ord(match.group(0)):02X} at line {line_no}, column {column} "
         f"(byte offset {offset}); {total} forbidden byte(s) in total; "
         f"excerpt={excerpt!r}"
     )
