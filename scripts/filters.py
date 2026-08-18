@@ -1,35 +1,22 @@
 # -*- coding: utf-8 -*-
-"""
-filters.py — لایهٔ L0/L1 آبشارِ حقیقت‌سنجی: یکتاسازی و فیلترِ ارزانِ بی‌شبکه.
+"""L0/L1 of the verification cascade: de-duplication plus cheap offline checks.
 
-جای این ماژول در معماری
-────────────────────────
-    all/configs.txt → [L0 یکتاسازی] → [L1 فیلترِ ارزان] → L2 (TCP) → L3 (پروکسیِ واقعی)
+Pipeline position::
 
-هرچه یک کانفیگِ مرده دیرتر حذف شود، گران‌تر تمام می‌شود. L3 برای هر کانفیگ یک
-پروکسیِ واقعی بالا می‌آورد و یک درخواستِ HTTP می‌فرستد؛ L1 فقط رشته را نگاه
-می‌کند. پس هر چیزی که *بی شبکه* قابلِ داوری است باید همین‌جا حذف شود.
+    all/configs.txt -> [L0 dedup] -> [L1 cheap filter] -> L2 (TCP) -> L3 (proxy)
 
-چرا L0 (یکتاسازی) اصلاً وجود دارد
-──────────────────────────────────
-اندازه‌گیریِ واقعی روی `all/configs.txt` (۸٬۰۲۸ کانفیگ، کامیتِ `37bd177`):
+L3 spins up a real proxy and issues an HTTP request per config, so anything
+decidable *without* the network has to die here.
 
-    کانفیگ‌ها ................. ۸٬۰۲۸
-    نقاطِ پایانیِ یکتا (host,port) ۶٬۹۴۰
-    میزبانِ یکتا ................ ۵٬۰۶۸
+Why L0 exists: on a real 8,028 config snapshot there are only 6,940 unique
+(host, port) endpoints and 5,068 unique hosts, so ~13.6% of the network work
+is duplicated. L2/L3 therefore operate on endpoints, not on config lines.
 
-یعنی ۱۳.۶٪ از کارِ شبکه تکراری است. L2 و L3 روی *نقطهٔ پایانی* کار می‌کنند، نه
-روی سطرِ کانفیگ، و همین یک تصمیم پیش از هر بهینه‌سازیِ دیگری ۱۳.۶٪ صرفه دارد.
-
-قاعدهٔ داوری: پارسر داور است، نه regex
-───────────────────────────────────────
-درسِ گران‌قیمتِ این پروژه: هر بار که با `grep`/`rsplit` اندازه گرفتیم، عددمان
-غلط بود (IPv6 برهنه با `rsplit(':',1)` مثله می‌شود؛ vmessِ base64 ریمارک ندارد؛
-`vmess://` دو شکلِ متفاوت دارد). پس این ماژول **هیچ‌گاه** خودش URI را تجزیه
-نمی‌کند و همیشه از `converters.parse_proxy()` می‌پرسد.
-
-به همین دلیل `_is_unroutable_server` هم *بازاستفاده* می‌شود و بازنویسی نمی‌شود:
-یک قاعده در دو جا = دو رفتارِ واگرا در آینده.
+House rule: the parser is the judge, never a regex. Ad-hoc ``grep``/``rsplit``
+parsing produced wrong numbers every time (bare IPv6 gets truncated by
+``rsplit(':', 1)``, base64 vmess has no remark, ``vmess://`` has two shapes).
+This module always asks ``converters.parse_proxy()`` and reuses the server
+checks that live in ``converters`` instead of re-implementing them.
 """
 from __future__ import annotations
 
@@ -38,47 +25,30 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import converters
 
-#: پروتکل‌هایی که میدانِ `uuid` در آن‌ها *معنا* دارد. `shadowsocks`/`trojan`/
-#: `hysteria2` رمزِ عبورِ آزاد دارند، پس داوریِ شناسه روی آن‌ها بی‌معناست.
+#: Protocols where ``uuid`` identifies a user. shadowsocks/trojan/hysteria2 use
+#: a free-form password, so judging their id is meaningless.
 UUID_PROTOCOLS = frozenset({"vless", "vmess", "tuic"})
 
-#: شکلِ متعارفِ UUID با خط‌تیره: ۸-۴-۴-۴-۱۲ رقمِ شانزده‌شانزدهی.
+#: Canonical dashed UUID, 8-4-4-4-12 hex digits.
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 
-#: ★ سقفِ ۳۰ بایتیِ «رشتهٔ سفارشی» — از خودِ مشخصاتِ رسمیِ Xray، نه از حدس.
-#:
-#: این عدد نتیجهٔ یک تصحیحِ سختِ همین فاز است. نخستین پیاده‌سازیِ من شرط را
-#: «UUIDِ متعارف، وگرنه حذف» گذاشت. اندازه‌گیری روی دادهٔ زنده ۱۱۳ حذف داد و
-#: بازرسیِ آن ۱۱۳ نشان داد اکثرشان شناسه‌های *مشروع*‌اند:
-#:
-#:     '@free_conf_iran' ×۱۳ · '13094' · 'AlfredConfig' · 'f23bb427c1f9…' ×۲۰
-#:
-#: مستندِ رسمیِ Xray برای **هر دو** پروتکلِ VLESS و VMess صریح است:
-#:
-#:   «User ID … can be any string less than 30 bytes, or a valid UUID.
-#:    A custom string and its mapped UUID are equivalent.»
-#:   — xtls.github.io/en/config/inbounds/{vless,vmess}.html
-#:
-#: یعنی هستهٔ Xray رشتهٔ سفارشی را با نگاشتِ UUIDv5 (issue #158) به UUID تبدیل
-#: می‌کند و آن دو **هم‌ارز**اند. پس قاعدهٔ اولِ من ۱۱۳ کانفیگِ سالم را می‌کشت.
-#: شاهدِ تکمیلی: `sing-box check` و `mihomo -t` روی خروجیِ همان‌ها rc=0 دادند.
-_CUSTOM_ID_MAX_BYTES = 30
-
-#: شکلِ فشردهٔ ۳۲‌رقمیِ UUID (بی خط‌تیره). ۳۲ بایت است، پس از سقفِ ۳۰ بایتی
-#: می‌گذرد و اگر صریحاً مجاز نشود حذف می‌شود. سنجشِ واقعی: ۲۰ کانفیگِ vmess با
-#: شناسهٔ `f23bb427c1f94373876c2f43e9f790f3` که `sing-box check` و `mihomo -t`
-#: هر دو با rc=0 پذیرفتندشان.
+#: Compact 32-hex UUID. It is 32 bytes so it exceeds the custom-string budget
+#: below and must be allowed explicitly; sing-box and mihomo both accept it.
 _UUID_RE_COMPACT = re.compile(r"^[0-9a-fA-F]{32}$")
 
-#: UUIDِ تهی: شکلش بی‌عیب است ولی مقدارِ جانگهدارِ تولیدکنندهٔ بالادست است و
-#: هیچ سروری آن را کاربرِ واقعی نمی‌داند.
-_NIL_UUID = "00000000-0000-0000-0000-000000000000"
+#: Xray accepts "any string less than 30 bytes, or a valid UUID" for VLESS and
+#: VMess user ids and maps custom strings to a UUIDv5. Requiring a canonical
+#: UUID dropped 113 working configs (e.g. '@free_conf_iran', 'AlfredConfig').
+_CUSTOM_ID_MAX_BYTES = 30
 
-#: دلیل‌های حذف. رشته‌ها بخشی از قراردادِ خروجی‌اند (در `health.json` می‌نشینند)
-#: پس تغییرشان تغییرِ شکسته‌ساز است.
+#: All-zero UUID: well formed, but an upstream placeholder, never a real user.
+_NIL_UUID_HEX = "0" * 32
+
+# Drop reasons. These strings ship inside health.json, so renaming one is a
+# breaking change.
 REASON_UNPARSABLE = "unparsable"
 REASON_INVALID_PORT = "invalid_port"
 REASON_INVALID_UUID = "invalid_uuid"
@@ -94,175 +64,174 @@ ALL_REASONS = (
 )
 
 
-def is_invalid_port(port: Any) -> bool:
-    """
-    آیا پورت بیرونِ بازهٔ معتبرِ TCP است؟
+def _as_port(value: Any) -> Optional[int]:
+    """Parse a TCP port, or ``None`` when it is not a usable one.
 
-    بازهٔ معتبر ۱..۶۵۵۳۵ است. `0` عمداً نامعتبر شمرده می‌شود: از نظرِ فنی
-    «پورتِ رزروشده» است و هیچ سروری روی آن گوش نمی‌دهد، پس کانفیگش مرده است.
-    مقدارِ غیرِعددی هم نامعتبر است — نه اینکه استثنا پرتاب کند.
+    Port 0 is rejected on purpose: it is reserved and nothing listens on it.
     """
     try:
-        p = int(str(port).strip())
+        port = int(str(value).strip())
     except (TypeError, ValueError):
-        return True
-    return not (0 < p < 65536)
+        return None
+    return port if 0 < port < 65536 else None
+
+
+def is_invalid_port(port: Any) -> bool:
+    """True when ``port`` is outside the usable TCP range 1..65535."""
+    return _as_port(port) is None
 
 
 def is_invalid_uuid(uuid: Any, proto: str) -> bool:
-    """
-    آیا شناسهٔ کاربر برای پروتکلی که شناسه می‌خواهد، *به‌حکمِ مشخصات* نامعتبر است؟
+    """True when a user id is invalid *per the Xray spec* for ``proto``.
 
-    قاعده مستقیماً از مستندِ رسمیِ Xray گرفته شده (بندِ `_CUSTOM_ID_MAX_BYTES`):
-    شناسه معتبر است اگر **یا** UUIDِ متعارف باشد **یا** رشته‌ای کوتاه‌تر از
-    ۳۰ بایت. پس تنها سه چیز نامعتبر است:
+    An id is valid when it is a canonical UUID, a compact 32-hex UUID, or a
+    custom string shorter than 30 bytes. So only three things fail: an empty
+    id, a non-UUID string of 30 bytes or more, and the nil UUID.
 
-      • تهی — هیچ کاربری را مشخص نمی‌کند
-      • ۳۰ بایت یا بیشتر و UUIDِ متعارف هم نیست — بیرونِ هر دو راهِ مجاز
-      • UUIDِ تهی (`000…0`) — جانگهدار، نه کاربر
-
-    برای پروتکل‌های بیرونِ `UUID_PROTOCOLS` همیشه `False`: در `shadowsocks`
-    این میدان رمزِ عبور است و هر رشته‌ای مجاز. سنجیدنِ UUID روی آن‌ها یعنی
-    حذفِ کانفیگِ سالم — همان خطایی که با «فهرستِ دستیِ رشته‌های بد» کرده بودیم.
-
-    مقایسه با UUID *پس از* برداشتنِ خط‌تیره‌ها انجام نمی‌شود؛ شکلِ بی‌خط‌تیرهٔ
-    ۳۲‌رقمی خودش زیرِ ۳۰ بایت نیست (۳۲ بایت است) ولی هستهٔ Xray می‌پذیردش، پس
-    صریحاً در `_UUID_RE_COMPACT` مجاز شمرده می‌شود — سنجیده با دو کلاینتِ واقعی.
+    Always False outside :data:`UUID_PROTOCOLS`, where the field is a password.
     """
     if proto not in UUID_PROTOCOLS:
         return False
-    s = str(uuid or "").strip()
-    if not s:
+    ident = str(uuid or "").strip()
+    if not ident:
         return True
-    if _UUID_RE.match(s) or _UUID_RE_COMPACT.match(s):
-        return s.replace("-", "").lower() == _NIL_UUID.replace("-", "")
-    return len(s.encode("utf-8")) >= _CUSTOM_ID_MAX_BYTES
+    if _UUID_RE.match(ident) or _UUID_RE_COMPACT.match(ident):
+        return ident.replace("-", "").lower() == _NIL_UUID_HEX
+    return len(ident.encode("utf-8")) >= _CUSTOM_ID_MAX_BYTES
 
 
 def endpoint_of_proxy(p: Dict[str, Any]) -> Optional[Tuple[str, int]]:
-    """
-    `(host, port)` از یک پروکسیِ تجزیه‌شده — یا `None` اگر ساختاراً بی‌معنا باشد.
+    """``(host, port)`` for a parsed proxy, or ``None`` if it is unusable.
 
-    کروشهٔ IPv6 برداشته می‌شود چون L2 نشانی را به `getaddrinfo`/`open_connection`
-    می‌دهد و آن‌ها نشانیِ برهنه می‌خواهند، نه شکلِ URI.
+    IPv6 brackets are stripped: L2 passes the host to ``getaddrinfo`` /
+    ``open_connection``, which want the bare address rather than URI syntax.
     """
     host = str(p.get("server") or "").strip().strip("[]").lower()
-    try:
-        port = int(str(p.get("port")).strip())
-    except (TypeError, ValueError):
-        return None
-    if not host or not (0 < port < 65536):
+    port = _as_port(p.get("port"))
+    if not host or port is None:
         return None
     return host, port
 
 
 def classify(line: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """
-    یک سطر را داوری می‌کند: `(proxy, None)` اگر بگذرد، `(None, reason)` اگر بیفتد.
+    """Judge one line: ``(proxy, None)`` on pass, ``(None, reason)`` on drop.
 
-    ترتیبِ دروازه‌ها *معنادار* است و از ارزان به گران چیده شده؛ اولین دلیلِ
-    برخورد گزارش می‌شود تا آمار قابلِ‌ردیابی بماند:
-
-      ۱. تجزیه‌ناپذیر  ← بی این، بقیهٔ داوری‌ها میدانی برای خواندن ندارند
-      ۲. پورتِ نامعتبر
-      ۳. سرورِ بدشکلِ ساختاری   (بازاستفاده از منطقِ فاز H8)
-      ۴. سرورِ غیرقابلِ‌مسیریابی (بازاستفاده از منطقِ فاز H7)
-      ۵. UUIDِ بدشکل
+    Gates run cheapest first and the first hit is reported, so the counters
+    stay attributable: unparsable, bad port, malformed server, unroutable
+    server, malformed uuid.
     """
-    p = converters.parse_proxy(line)
-    if not p:
+    proxy = converters.parse_proxy(line)
+    if not proxy:
         return None, REASON_UNPARSABLE
-    if is_invalid_port(p.get("port")):
+    if is_invalid_port(proxy.get("port")):
         return None, REASON_INVALID_PORT
-    server = p.get("server")
-    # بازاستفادهٔ آگاهانه: این دو قاعده در `converters` صاحبِ خانه دارند.
+    server = proxy.get("server")
+    # Deliberate reuse: both rules are owned by `converters`. One rule in two
+    # places becomes two diverging rules.
     if converters._is_structurally_invalid_server(server):
         return None, REASON_INVALID_SERVER
     if converters._is_unroutable_server(server):
         return None, REASON_UNROUTABLE
-    if is_invalid_uuid(p.get("uuid"), str(p.get("type") or "")):
+    if is_invalid_uuid(proxy.get("uuid"), str(proxy.get("type") or "")):
         return None, REASON_INVALID_UUID
-    return p, None
+    return proxy, None
+
+
+class _EndpointIndex:
+    """Accumulates kept lines and the endpoint <-> line mapping around them."""
+
+    def __init__(self) -> None:
+        self.kept: List[str] = []
+        self.endpoints: List[Tuple[str, int]] = []
+        self.ep_to_lines: Dict[Tuple[str, int], List[int]] = {}
+        self.line_endpoint: List[Tuple[str, int]] = []
+
+    def add(self, line: str, endpoint: Tuple[str, int]) -> None:
+        index = len(self.kept)
+        self.kept.append(line)
+        self.line_endpoint.append(endpoint)
+        if endpoint not in self.ep_to_lines:
+            self.endpoints.append(endpoint)
+            self.ep_to_lines[endpoint] = []
+        self.ep_to_lines[endpoint].append(index)
+
+    @property
+    def unique_hosts(self) -> int:
+        return len({host for host, _ in self.endpoints})
+
+
+def _stats(index: _EndpointIndex, total: int, dropped_total: int) -> Dict[str, Any]:
+    kept = len(index.kept)
+    unique = len(index.endpoints)
+    return {
+        "input": total,
+        "kept": kept,
+        "dropped": dropped_total,
+        "endpoints_unique": unique,
+        "hosts_unique": index.unique_hosts,
+        "removal_pct": round(100.0 * dropped_total / total, 2) if total else 0.0,
+        "dedup_saving_pct": round(100.0 * (1 - unique / kept), 2) if kept else 0.0,
+    }
 
 
 def filter_lines(lines: Iterable[str]) -> Dict[str, Any]:
-    """
-    L0 + L1 روی یک دنبالهٔ سطر.
+    """Run L0 + L1 over a sequence of lines.
 
-    خروجی — کلیدها بخشی از قراردادِ `health.json` هستند:
-        kept          : سطرهایی که از L1 گذشتند (ترتیبِ ورودی حفظ می‌شود)
-        endpoints     : `(host, port)` یکتا به‌ترتیبِ نخستین دیدار
-        ep_to_lines   : نقطهٔ پایانی → فهرستِ اندیسِ سطرها در `kept`
-        line_endpoint : اندیسِ `kept` → نقطهٔ پایانی
-        dropped       : {دلیل: تعداد} — همهٔ دلیل‌ها حاضرند، حتی صفرها
-        stats         : شمارش‌های خلاصه برای تلمتری
+    Returned keys are part of the ``health.json`` contract::
+
+        kept          lines that passed L1, input order preserved
+        endpoints     unique (host, port) in first-seen order
+        ep_to_lines   endpoint -> indices into `kept`
+        line_endpoint index into `kept` -> endpoint
+        dropped       {reason: count}, every reason present even at zero
+        stats         summary counters for telemetry
     """
-    kept: List[str] = []
-    endpoints: List[Tuple[str, int]] = []
-    ep_index: Dict[Tuple[str, int], int] = {}
-    ep_to_lines: Dict[Tuple[str, int], List[int]] = {}
-    line_endpoint: List[Tuple[str, int]] = []
-    dropped: Dict[str, int] = {r: 0 for r in ALL_REASONS}
+    index = _EndpointIndex()
+    dropped: Dict[str, int] = {reason: 0 for reason in ALL_REASONS}
     total = 0
 
     for raw in lines:
         line = (raw or "").strip()
-        # سرآیندِ توضیحیِ فایل کانفیگ نیست. شمردنش آمار را باد می‌کند —
-        # همان اشتباهی که در سنجش‌های پیشین مرتکب شدیم.
+        # Blank lines and comment headers are not configs; counting them
+        # inflates every downstream percentage.
         if not line or line.startswith("#"):
             continue
         total += 1
-        p, reason = classify(line)
+        proxy, reason = classify(line)
         if reason is not None:
             dropped[reason] += 1
             continue
-        ep = endpoint_of_proxy(p or {})
-        if ep is None:
-            # تورِ ایمنی: `classify` باید این را گرفته باشد. اگر این‌جا رسید،
-            # یعنی ناسازگاری میانِ دو تابع — و باید در آمار دیده شود نه پنهان.
+        endpoint = endpoint_of_proxy(proxy or {})
+        if endpoint is None:
+            # Unreachable while `classify` and `endpoint_of_proxy` agree. Kept
+            # as a visible counter rather than a silent `continue` so any future
+            # divergence shows up in the stats instead of hiding.
             dropped[REASON_INVALID_PORT] += 1
             continue
-        idx = len(kept)
-        kept.append(line)
-        line_endpoint.append(ep)
-        if ep not in ep_index:
-            ep_index[ep] = len(endpoints)
-            endpoints.append(ep)
-            ep_to_lines[ep] = []
-        ep_to_lines[ep].append(idx)
+        index.add(line, endpoint)
 
     dropped_total = sum(dropped.values())
     return {
-        "kept": kept,
-        "endpoints": endpoints,
-        "ep_to_lines": ep_to_lines,
-        "line_endpoint": line_endpoint,
+        "kept": index.kept,
+        "endpoints": index.endpoints,
+        "ep_to_lines": index.ep_to_lines,
+        "line_endpoint": index.line_endpoint,
         "dropped": dropped,
-        "stats": {
-            "input": total,
-            "kept": len(kept),
-            "dropped": dropped_total,
-            "endpoints_unique": len(endpoints),
-            "hosts_unique": len({h for h, _ in endpoints}),
-            "removal_pct": round(100.0 * dropped_total / total, 2) if total else 0.0,
-            "dedup_saving_pct": (
-                round(100.0 * (1 - len(endpoints) / len(kept)), 2) if kept else 0.0
-            ),
-        },
+        "stats": _stats(index, total, dropped_total),
     }
 
 
 def filter_file(path: str) -> Dict[str, Any]:
-    """`filter_lines` روی یک فایل. رمزگشاییِ بخشنده چون دادهٔ بالادست است."""
+    """:func:`filter_lines` over a file. Lenient decoding: this is upstream data."""
     with open(path, encoding="utf-8", errors="replace") as fh:
         return filter_lines(fh)
 
 
-if __name__ == "__main__":  # pragma: no cover - ابزارِ خطِ فرمان
+if __name__ == "__main__":  # pragma: no cover - CLI helper
     import json
     import sys
 
     target = sys.argv[1] if len(sys.argv) > 1 else "all/configs.txt"
-    res = filter_file(target)
-    print(json.dumps({"stats": res["stats"], "dropped": res["dropped"]},
+    result = filter_file(target)
+    print(json.dumps({"stats": result["stats"], "dropped": result["dropped"]},
                      ensure_ascii=False, indent=2))
