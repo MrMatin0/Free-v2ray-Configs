@@ -1,119 +1,69 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-لایهٔ L3 — آزمونِ *واقعیِ* پروکسی با xray-knife (فاز B، بندِ B4).
+"""L3 of the cascade: the *real* proxy test, via xray-knife.
 
-جایگاهِ این لایه در آبشار:
+    L0  endpoint dedup        filters.py
+    L1  cheap offline filter  filters.py
+    L2  TCP handshake         reachability.py
+    L3  real proxy test       this module
 
-    L0  یکتاسازیِ نقطهٔ پایانی    ← filters.py
-    L1  پالایشِ ارزانِ بی‌شبکه     ← filters.py
-    L2  دست‌دادنِ TCP             ← reachability.py
-    L3  آزمونِ واقعیِ پروکسی      ← همین ماژول
+L2 only proves a socket opened. L3 proves traffic actually traversed the proxy
+and reached the internet. The gap is large on real data::
 
-L2 فقط می‌گوید «سوکت باز شد». L3 می‌گوید «ترافیک واقعاً از این پروکسی
-گذشت و به اینترنت رسید». فاصلهٔ این دو در سرشماریِ واقعی بزرگ است:
+    raw input          8,028 configs
+    after L0/L1/L2     3,845 configs  (47.91%)
+    after L3             504 configs  (13.11% of L2, 6.28% of raw)
 
-    خامِ ورودی            ۸٬۰۲۸ کانفیگ
-    پس از L0/L1/L2        ۳٬۸۴۵ کانفیگ  (۴۷٫۹۱٪)
-    پس از L3              ۵۰۴ کانفیگ    (۱۳٫۱۱٪ از L2، ۶٫۲۸٪ از خام)
+Seven measured decisions
 
-──────────────────────────────────────────────────────────────────────────────
-هفت تصمیمِ طراحی، هرکدام پشتِ یک اندازه‌گیریِ زنده — نه پشتِ شهود
-──────────────────────────────────────────────────────────────────────────────
+1. `semi-passed` is accepted, correcting our own earlier plan. Across all 55
+   semi-passed rows in a full census, with zero exceptions: success == total,
+   code == 204, the endpoint column said ok(NNNms), and the only reason was
+   `ip_info_failed` with ip and location both "null". The semi-passed set is
+   bit-for-bit the set of successful rows with location == "null", while 449
+   `passed` rows have zero null ips. So semi-passed means "the proxy worked but
+   the optional --rip lookup failed", and rejecting it silently discarded 55
+   healthy configs, 10.9% of final output.
 
-۱) `semi-passed` پذیرفته می‌شود، و این اصلاحِ پلنِ خودِ ما است.
-   پلنِ اولیه (`PHASE_B_PLAN.md`) گفته بود `semi-passed` باید **رد** شود.
-   آن حکم از متنِ راهنما استنباط شده بود، نه از داده. سنجشِ ۵۵ سطرِ
-   `semi-passed` در سرشماریِ کاملِ ۳٬۸۴۵ سطری، با **صفر استثنا**:
+2. `success == total` alone is not enough. `broken` rows carry
+   success=0, total=0, which satisfies it (0 == 0), so 87 broken rows counted as
+   successes. The correct lock is total >= 1 and success == total and
+   200 <= code < 400; on the census it reproduces the 504-row success set exactly.
 
-       success == total  (۵۵ از ۵۵)
-       code == 204       (۵۵ از ۵۵)
-       endpoints         `...=ok(NNNms)`  ← نقطهٔ پایانی *موفق* بود
-       reason            `ip_info_failed` ← تنها همین، هیچ چیزِ دیگر
-       ip == "null"      (۵۵ از ۵۵)
-       location == "null"(۵۵ از ۵۵)
+3. Two full CI-hang paths, found and closed. Given a missing or empty input the
+   tool prints an error and then *waits on stdin* ("Please enter a config link").
+   Under CI, where stdin never closes: empty file -> rc=124 hang, missing file ->
+   rc=124 hang, empty file with </dev/null -> rc=1 clean failure. A hang burns
+   the full 6 hour GitHub limit and the `aggregate` concurrency group queues
+   every later run behind it. The empty-input case is realistic: it happens
+   whenever L2 leaves zero open endpoints. Three defences: check the input
+   exists and is non-blank, pass stdin=DEVNULL, and impose a hard Python timeout.
 
-   و اثباتِ هم‌ارزیِ مجموعه‌ها: مجموعهٔ `semi-passed` **بیت‌به‌بیت** برابرِ
-   مجموعهٔ سطرهای موفق با `location == "null"` است (۵۵ == ۵۵، اختلافِ
-   دوسویه = ۰). در مقابل، ۴۴۹ سطرِ `passed` **صفر** موردِ `ip == "null"`
-   دارند. یعنی `semi-passed` هیچ ربطی به «شکستِ نیمهٔ پروکسی» ندارد؛
-   یعنی «پروکسی کامل کار کرد، ولی جست‌وجویِ *اختیاریِ* اطلاعاتِ IP
-   (`--rip`) شکست خورد». ردکردنش ۵۵ کانفیگِ سالم (۱۰٫۹٪ از خروجیِ نهایی)
-   را خاموشانه دور می‌ریخت.
+4. Stale output survives a failed run, the most dangerous finding here. A CSV
+   containing STALE_MARKER, followed by a failing run against the same -o, gave
+   rc=1 and left STALE_MARKER intact, so last run's data reads as fresh results.
+   The output file is therefore deleted before every run.
 
-۲) `success == total` به‌تنهایی **کافی نیست** — یک سوراخِ واقعی.
-   سطرهای `broken` مقدارِ `success=0, total=0` دارند، پس شرطِ
-   `success == total` برای آن‌ها هم **درست** است (۰ == ۰). سنجش:
+5. `-o` does not create the parent directory and lies when it is missing:
+   rc=0, "Results have been saved to ...", and no file on disk. So the parent is
+   created here and the file's existence is verified afterwards.
 
-       passed       ۴۴۹ سطر  → success==total: ۴۴۹  (همه)
-       semi-passed   ۵۵ سطر  → success==total:  ۵۵  (همه)
-       failed     ۳٬۲۵۴ سطر  → success==total:   ۰
-       broken        ۸۷ سطر  → success==total:  ۸۷  (همه!)  ← سوراخ
+6. The exit code never reflects result quality. A single completely dead link
+   returns rc=0. Quality comes only from the CSV.
 
-   قفلِ درست، که روی سرشماری آزموده شد و مجموعهٔ موفق را **دقیقاً**
-   بازتولید کرد (۵۰۴ در هر دو سو، اختلافِ دوسویه = ۰):
+7. The CSV must be read with the `csv` module. On the 3,845 row census,
+   `split(",")` produced the wrong field count for 236 rows, because 182 links
+   contain commas and 3,321 rows are quoted. Naive splitting silently corrupted
+   about 6% of the data.
 
-       total >= 1  و  success == total  و  200 <= code < 400
+Why --retries and --max-passed are unused: --retries hides flakiness *inside* a
+run (measured flakiness is 32.7%, 17 of 52 links over 3 runs), and separating
+stable from lucky is the caller's job, so repetition belongs a layer up.
+--max-passed returns incomplete output (--max-passed 2 -t 5 returned 5 rows),
+so a link's absence from the CSV can never be read as failure. Both flags are
+still supported for manual use, and the result is flagged ``partial``.
 
-۳) دو مسیرِ **قفل‌شدنِ کاملِ CI** — کشف‌شده و بسته‌شده.
-   با ورودیِ **ناموجود** یا **تهی**، ابزار خطا چاپ می‌کند و سپس روی
-   ورودیِ استاندارد **منتظر می‌ماند** («Please enter a config link»).
-   بازتولید زیرِ شرطِ واقعیِ CI (stdin یک FIFO که بسته نمی‌شود):
-
-       فایلِ تهی    + stdin باز        → rc=124  (قفل)
-       فایلِ ناموجود + stdin باز        → rc=124  (قفل)
-       فایلِ تهی    + `</dev/null`     → rc=1    (شکستِ پاک)
-       فایلِ فقط‌فاصله + stdin باز       → rc=0    (بی‌خطر، CSV سرآیندی)
-
-   در CI ورودیِ استاندارد هرگز بسته نمی‌شود، پس job تا سقفِ ۶ ساعتِ
-   GitHub می‌سوزد و `concurrency: group: aggregate` هر اجرایِ بعدی را
-   هم در صف نگه می‌دارد. حالتِ «فایلِ تهی» حالتِ واقع‌بینانه است: هر بار
-   که L2 صفر نقطهٔ بازِ باقی بگذارد همین رخ می‌دهد.
-   سه لایهٔ دفاع: (الف) بررسیِ وجود *و* ناتهی‌بودن پیش از فراخوانی،
-   (ب) `stdin=DEVNULL`، (ج) مهلتِ سختِ پایتونی.
-
-۴) خروجیِ کهنه **زنده می‌ماند** — و این خطرناک‌ترین موردِ سنجیده‌شده است.
-   سنجش: یک CSV با سطرِ `STALE_MARKER,passed` ساختیم، سپس اجرایِ
-   شکست‌خورده (فایلِ تهی) را با همان `-o` صدا زدیم. نتیجه: `rc=1` و
-   **`STALE_MARKER` دست‌نخورده باقی ماند**. اگر پس از یک اجرای ناموفق
-   خروجی خوانده شود، داده‌های *دفعهٔ قبل* به‌عنوانِ نتیجهٔ تازه خوانده
-   می‌شوند. پس خروجی **پیش از** هر اجرا حذف می‌شود.
-
-۵) `-o` پوشهٔ والد را نمی‌سازد، و در این حالت **دروغ می‌گوید**.
-   سنجش با `-o .../nodir/deep/s3.csv`:
-
-       rc = 0
-       پیام: «🎉 Results have been saved to /.../nodir/deep/s3.csv»
-       واقعیت: فایل **وجود ندارد**
-
-   یعنی نبودِ پوشهٔ والد = ازدست‌رفتنِ کاملِ داده، با کدِ خروجِ ۰ و پیامِ
-   موفقیت. پس والد خودمان ساخته می‌شود *و* وجودِ فایل پس از اجرا
-   تأیید می‌شود (`OutputNotWritten`).
-
-۶) کدِ خروج هرگز کیفیتِ نتیجه را نشان نمی‌دهد.
-   سنجش: ورودیِ تک‌لینکیِ کاملاً مرده → `rc=0`. پس `rc` فقط «ابزار
-   اجرا شد» را می‌گوید. داوریِ کیفیت تنها از CSV می‌آید.
-
-۷) CSV باید با ماژولِ `csv` خوانده شود، نه با `split(",")`.
-   سنجش روی سرشماریِ ۳٬۸۴۵ سطری: **۲۳۶ سطر** با `split(",")` تعدادِ
-   ستونِ اشتباه می‌دادند (۳٬۳۲۱ سطر نویسهٔ گیومه دارند و ۱۸۲ لینک خودشان
-   کاما دارند). یعنی تفکیکِ ساده حدودِ ۶٪ داده را خاموشانه خراب می‌کرد.
-
-──────────────────────────────────────────────────────────────────────────────
-چرا `--retries` و `--max-passed` استفاده نمی‌شوند؟
-──────────────────────────────────────────────────────────────────────────────
-
-`--retries` نااستواری را *داخلِ* یک اجرا پنهان می‌کند. نااستواریِ سنجیده‌شده
-۳۲٫۷٪ اتحاد است (۱۷ از ۵۲ لینک در ۳ اجرا). اگر ابزار خودش تلاشِ دوباره کند،
-دیگر نمی‌توان «پایدار» را از «خوش‌شانس» جدا کرد؛ و جداکردنِ همین دو کارِ
-بندِ B4b است. پس چندبار‌اجرا در لایهٔ بالاتر انجام می‌شود، نه با این پرچم.
-
-`--max-passed` خروجیِ **ناقص** می‌دهد: با `--max-passed 2 -t 5` پنج سطر
-برگشت (۲ موفق + ۳ نیمه‌کارهٔ شکست‌خورده). یعنی نبودِ یک لینک در CSV را
-هرگز نمی‌توان «شکست خورد» خواند. هر دو پرچم برای استفادهٔ دستی پشتیبانی
-می‌شوند، ولی نتیجه با `partial=True` علامت می‌خورد.
-
-خروجیِ `run_test` قراردادِ ورودیِ بندهای B5/B6/B7/B13 است:
+``run_test`` output is the input contract for the branding/publishing layers::
 
     {ok: [...], failed: [...], broken: [...],
      rows: {link: row}, stats: {...}, partial: bool}
@@ -128,36 +78,35 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# ──────────────────────────────────────────────────────────────────────────────
-# پارامترها — همه از سنجش آمده‌اند و همه با محیط قابلِ تنظیم‌اند
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+# Tunables. All measured, all overridable from the environment.
+# --------------------------------------------------------------------------- #
 
-#: مسیرِ باینری. نصبش در CI با نسخهٔ سنجیده و دو checksum انجام می‌شود (بندِ B3).
+#: Binary path. CI installs a pinned, checksum-verified release.
 XK_BIN = os.environ.get("L3_XK_BIN", "xray-knife")
 
-#: نشانیِ آزمون. **صریح** است و به پیش‌فرضِ ابزار تکیه نمی‌کند: پیش‌فرضِ
-#: v10.1.1 یعنی `https://cloudflare.com/cdn-cgi/trace` که HTTP 200 می‌دهد،
-#: ولی اجراهای مرجعِ ما HTTP 204 ثبت کرده‌اند. بی‌تثبیتِ این نشانی نتایجِ
-#: دو اجرا با هم قابلِ مقایسه نیستند.
+#: Test URL, set explicitly rather than relying on the tool default. v10.1.1
+#: defaults to cloudflare.com/cdn-cgi/trace, which answers 200, while our
+#: reference runs recorded 204. Without pinning this, two runs are not comparable.
 TEST_URL = os.environ.get("L3_TEST_URL", "https://cp.cloudflare.com/generate_204")
 
-#: رشته‌های آزمون. سنجشِ زنده روی همان ۳٬۸۴۵ کانفیگ: t=50 ← ۱۶۹ ثانیه،
-#: t=150 ← ۶۱ ثانیه، t=200 ← **۴۳ ثانیه**، t=300 ← بی‌بهبودِ معنادار.
+#: Worker threads. On the 3,845 config census: 50 -> 169s, 150 -> 61s,
+#: 200 -> 43s, 300 -> no meaningful gain.
 THREADS = int(os.environ.get("L3_THREADS", "200"))
 
-#: بیشترین تأخیرِ پذیرفتنی (میلی‌ثانیه) — همان پیش‌فرضِ ابزار، صریح‌شده.
+#: Max acceptable delay in ms, the tool default made explicit.
 MDELAY_MS = int(os.environ.get("L3_MDELAY", "5000"))
 
-#: مهلتِ هر درخواست (میلی‌ثانیه). پیش‌فرضِ ابزار ۰ (بی‌مهلت) است که در CI
-#: خطرناک است، پس صریحاً بسته می‌شود.
+#: Per-request timeout in ms. The tool defaults to 0 (unbounded), which is
+#: dangerous in CI, so it is closed explicitly.
 TIMEOUT_MS = int(os.environ.get("L3_TIMEOUT", "5000"))
 
-#: تورِ آخر. سرشماریِ کامل ۴۳ ثانیه بود؛ ۱۸۰۰ ثانیه ۴۲ برابرِ حاشیه دارد و
-#: هم‌زمان خیلی کمتر از سقفِ ۶ ساعتِ GitHub است.
+#: Last-resort net. The full census took 43s, so 1800s is 42x margin while
+#: staying far below GitHub's 6 hour ceiling.
 HARD_TIMEOUT = int(os.environ.get("L3_HARD_TIMEOUT", "1800"))
 
 STATUS_PASSED = "passed"
@@ -165,71 +114,69 @@ STATUS_SEMI = "semi-passed"
 STATUS_FAILED = "failed"
 STATUS_BROKEN = "broken"
 
-#: سطرهایی که «پروکسی کار کرد» را نشان می‌دهند. `semi-passed` عمداً این‌جاست
-#: (بندِ ۱ سند). هر عضو باز هم از قفلِ عددیِ `is_row_genuinely_ok` می‌گذرد.
+#: Statuses that mean "the proxy worked". semi-passed belongs here, see note 1.
+#: Every member still has to clear the numeric lock in is_row_genuinely_ok().
 OK_STATUSES = (STATUS_PASSED, STATUS_SEMI)
 
-#: هر چهار وضعیتِ سنجیده‌شده. تقسیمِ failed/broken معنادار است:
-#: `failed` = پروکسی ساخته شد ولی درخواست رد شد (سرورِ مرده — طبیعی و گذرا).
-#: `broken` = پروکسی هرگز ساخته نشد (دادهٔ بد — در سرچشمه قابلِ تعمیر).
+#: All four observed statuses. The failed/broken split matters:
+#: failed = proxy was built but the request was rejected (dead server, transient)
+#: broken = proxy was never built at all (bad data, fixable at the source)
 ALL_STATUSES = (STATUS_PASSED, STATUS_SEMI, STATUS_FAILED, STATUS_BROKEN)
 
-#: قراردادِ ستون‌ها. اگر بالادست شِما را عوض کند، باید **بلند** بشکند، نه
-#: این‌که خاموشانه ستونِ اشتباه خوانده شود.
+#: Column contract. An upstream schema change must break loudly rather than
+#: silently shift which column we read.
 CSV_COLUMNS = (
     "link", "status", "reason", "tls", "ip", "delay", "code", "download",
     "upload", "location", "ttfb", "connect_time", "success", "total",
     "endpoints",
 )
 
-#: ابزار «نبودِ مقدار» را رشتهٔ تحت‌اللفظیِ `null` می‌نویسد، نه فیلدِ تهی.
-#: سنجش: ستونِ `ip` در ۳٬۳۹۶ سطر دقیقاً `"null"` است و در **صفر** سطر تهی.
+#: The tool writes a literal "null" for absent values, never an empty field.
+#: Measured: the ip column is exactly "null" in 3,396 rows and empty in zero.
 NULL_TOKEN = "null"
 
-#: بازهٔ کدِ موفق. سنجش: تنها دو مقدار در سرشماری دیده شد — ۲۰۴ (۵۰۴ سطر،
-#: همه موفق) و ‎-۱ (۳٬۳۴۱ سطر، همه ناموفق).
+#: Successful HTTP code range. The census only ever showed 204 (504 rows, all
+#: successful) and -1 (3,341 rows, all unsuccessful).
 CODE_MIN_OK = 200
 CODE_MAX_OK = 400
 
 
 class XrayKnifeMissing(RuntimeError):
-    """باینریِ xray-knife پیدا نشد — این خطای محیط است، نه خطای داده."""
+    """The xray-knife binary was not found. An environment fault, not a data one."""
 
 
 class XrayKnifeFailed(RuntimeError):
-    """ابزار اجرا شد ولی به‌درستی تمام نشد (کدِ خروجِ ناصفر یا مهلتِ سخت)."""
+    """The tool ran but did not finish properly: non-zero exit or hard timeout."""
 
 
 class EmptyInput(ValueError):
-    """
-    ورودی تهی یا ناموجود است.
+    """Input is missing or empty.
 
-    چرا استثنا و نه «صفر نتیجه»؟ چون سنجشِ زنده نشان داد همین دو حالت
-    باعثِ **قفل‌شدنِ** ابزار روی ورودیِ استاندارد می‌شوند (rc=124 زیرِ
-    stdin بازِ CI). این استثنا آن مسیر را پیش از فراخوانی می‌بندد.
+    Raised rather than returning zero results because both cases make the tool
+    block on stdin (rc=124 under CI's open stdin). This closes that path before
+    the process is ever started.
     """
 
 
 class OutputNotWritten(RuntimeError):
-    """
-    ابزار «ذخیره شد» گفت ولی فایل وجود ندارد.
+    """The tool reported success but no file exists.
 
-    سنجش: با `-o` به پوشهٔ ناموجود، `rc=0` و پیامِ
-    «🎉 Results have been saved to ...» آمد و فایل **ساخته نشد**. بی این
-    بررسی، ازدست‌رفتنِ کاملِ داده به‌شکلِ «صفر کانفیگِ سالم» ظاهر می‌شود.
+    Measured with -o pointing into a missing directory: rc=0, a cheerful
+    "Results have been saved to ...", and no file. Without this check, total data
+    loss looks like "zero healthy configs".
     """
 
 
 class MalformedCsv(ValueError):
-    """CSV با قراردادِ ۱۵ستونی نمی‌خواند — بالادست شِما را عوض کرده است."""
+    """The CSV does not match the 15-column contract; upstream changed the schema."""
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# داوری روی یک سطر
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+# Row-level judgement
+# --------------------------------------------------------------------------- #
 
 def _as_int(value: Optional[str]) -> Optional[int]:
-    """عددِ صحیح، یا None اگر مقدار عدد نباشد (شاملِ `null` و تهی)."""
+    """Integer value, or None when it is not numeric (covers "null" and empty)."""
     if value is None:
         return None
     text = value.strip()
@@ -242,23 +189,21 @@ def _as_int(value: Optional[str]) -> Optional[int]:
 
 
 def is_row_genuinely_ok(row: Dict[str, str]) -> bool:
-    """
-    آیا این سطر یعنی «پروکسی واقعاً کار کرد»؟
+    """Whether this row means "the proxy really worked".
 
-    قفل چهار شرط دارد و هر چهار لازم‌اند:
+    Four conditions, all required::
 
-        ۱) status ∈ OK_STATUSES        — شاملِ `semi-passed` (بندِ ۱ سند)
-        ۲) total >= 1                  — سطرِ `broken` مقدارِ total=0 دارد
-        ۳) success == total            — همهٔ نقاطِ پایانی موفق بوده‌اند
-        ۴) 200 <= code < 400           — پاسخِ HTTP واقعاً موفق بوده
+        status in OK_STATUSES     includes semi-passed, see note 1
+        total >= 1                broken rows report total = 0
+        success == total          every endpoint succeeded
+        200 <= code < 400         the HTTP response really succeeded
 
-    شرطِ ۲ تنها به لطفِ سنجش این‌جاست: بی آن، `success == total` برای
-    ۸۷ سطرِ `broken` هم درست بود (۰ == ۰) و آن‌ها را «موفق» می‌شمردیم.
+    The total >= 1 clause exists only because of measurement: without it,
+    success == total was also true for 87 broken rows (0 == 0).
 
-    اعتبارسنجی روی سرشماریِ کاملِ ۳٬۸۴۵ سطری: این قفل دقیقاً ۵۰۴ سطر
-    را می‌پذیرد و مجموعه‌اش با مجموعهٔ `status ∈ OK_STATUSES` **یکی**
-    است (اختلافِ دوسویه = ۰) — یعنی نه سخت‌گیرتر است و نه سست‌تر، بلکه
-    همان داوری را از دو راهِ مستقل تأیید می‌کند.
+    Validated on the full 3,845 row census: this lock accepts exactly 504 rows
+    and its set is identical to the status-only set, so it is neither stricter
+    nor looser, it confirms the same verdict two independent ways.
     """
     if (row.get("status") or "").strip() not in OK_STATUSES:
         return False
@@ -273,7 +218,7 @@ def is_row_genuinely_ok(row: Dict[str, str]) -> bool:
 
 
 def row_delay_ms(row: Dict[str, str]) -> Optional[int]:
-    """تأخیر به میلی‌ثانیه، یا None. سنجش: بازهٔ سطرهای موفق ۵۴ تا ۴٬۷۷۶."""
+    """Delay in ms, or None. Measured range across successes: 54 to 4,776."""
     delay = _as_int(row.get("delay"))
     if delay is None or delay < 0:
         return None
@@ -281,38 +226,31 @@ def row_delay_ms(row: Dict[str, str]) -> Optional[int]:
 
 
 def row_location(row: Dict[str, str]) -> Optional[str]:
-    """کدِ کشورِ گزارش‌شدهٔ ابزار، یا None اگر `null`/تهی باشد."""
-    loc = (row.get("location") or "").strip()
-    if not loc or loc == NULL_TOKEN:
+    """Country code as reported by the tool, or None when null/empty."""
+    location = (row.get("location") or "").strip()
+    if not location or location == NULL_TOKEN:
         return None
-    return loc
+    return location
 
 
 def row_tls(row: Dict[str, str]) -> str:
-    """
-    لایهٔ امنیت، خام. سنجشِ مقادیرِ دیده‌شده در سرشماری:
-    `tls` ۲٬۰۳۲ · تهی ۸۲۸ · `none` ۵۶۵ · `reality` ۴۱۴ · `false` ۴ ·
-    `…` ۱ · `auto` ۱. داوریِ «امن» کارِ بندِ B7 است، نه این‌جا.
+    """Raw security layer. Observed values: tls 2,032, empty 828, none 565,
+    reality 414, false 4, "..." 1, auto 1. Deciding what counts as "secure"
+    belongs to the publishing layer, not here.
     """
     return (row.get("tls") or "").strip()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# خواندنِ CSV
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+# CSV reading
+# --------------------------------------------------------------------------- #
 
 def parse_csv(text: str) -> List[Dict[str, str]]:
-    """
-    CSV ابزار را به سطرهای دیکشنری تبدیل می‌کند.
+    """Turn the tool's CSV into dict rows.
 
-    عمداً از ماژولِ `csv` استفاده می‌شود، نه `split(",")`: سنجش روی
-    سرشماریِ ۳٬۸۴۵ سطری نشان داد **۲۳۶ سطر** با تفکیکِ سادهٔ کاما تعدادِ
-    ستونِ اشتباه می‌دهند، چون ۱۸۲ لینک خودشان کاما دارند و ۳٬۳۲۱ سطر
-    گیومه‌گذاری‌شده‌اند.
-
-    اگر سرآیند با `CSV_COLUMNS` نخواند، `MalformedCsv` پرتاب می‌شود —
-    نه بازگشتِ خاموشِ فهرستِ تهی. بالادست ممکن است روزی ستونی اضافه کند و
-    آن روز باید **بلند** بشکنیم.
+    Uses the `csv` module deliberately, see note 7. A header that does not match
+    CSV_COLUMNS raises instead of returning an empty list, because reading the
+    wrong column would mis-grade every config.
     """
     if not text.strip():
         return []
@@ -335,19 +273,35 @@ def parse_csv(text: str) -> List[Dict[str, str]]:
             )
         if any(value is None for value in raw.values()):
             raise MalformedCsv(
-                f"a CSV row is short of the 15-column contract: {raw!r}"
-            )
+                f"a CSV row is short of the 15-column contract: {raw!r}")
         rows.append({key: (value or "") for key, value in raw.items()})
     return rows
 
 
-def classify(rows: Sequence[Dict[str, str]]) -> Dict[str, Any]:
-    """
-    سطرها را به سه سبد می‌ریزد و آمار می‌سازد.
+def _delay_summary(ok_links: Sequence[str],
+                   by_link: Dict[str, Dict[str, str]]) -> Dict[str, Optional[int]]:
+    """min / median / max delay over successful rows.
 
-    تقسیمِ `failed` از `broken` عمدی است: `broken` یعنی کانفیگ هرگز ساخته
-    نشد (دادهٔ بد — در سرچشمه قابلِ تعمیر)، `failed` یعنی سرور جواب نداد
-    (طبیعی و گذرا). یک‌جا شمردنشان کیفیتِ سرچشمه‌ها را پنهان می‌کند.
+    ``delay_median`` is the upper median for an even count. Kept as-is because
+    the value is published in health.json and a true median would shift it.
+    """
+    delays = sorted(d for d in (row_delay_ms(by_link[link]) for link in ok_links)
+                    if d is not None)
+    if not delays:
+        return {"delay_min": None, "delay_median": None, "delay_max": None}
+    return {
+        "delay_min": delays[0],
+        "delay_median": delays[len(delays) // 2],
+        "delay_max": delays[-1],
+    }
+
+
+def classify(rows: Sequence[Dict[str, str]]) -> Dict[str, Any]:
+    """Sort rows into ok / failed / broken and build the stats block.
+
+    The failed/broken split is deliberate: broken means the config was never
+    built (bad data, fixable at the source), failed means the server did not
+    answer (normal and transient). Merging them hides source quality.
     """
     ok: List[str] = []
     failed: List[str] = []
@@ -371,8 +325,6 @@ def classify(rows: Sequence[Dict[str, str]]) -> Dict[str, Any]:
         else:
             failed.append(link)
 
-    delays = [row_delay_ms(by_link[link]) for link in ok]
-    delays = sorted(d for d in delays if d is not None)
     stats: Dict[str, Any] = {
         "rows": len(rows),
         "ok": len(ok),
@@ -381,30 +333,27 @@ def classify(rows: Sequence[Dict[str, str]]) -> Dict[str, Any]:
         "ok_pct": round(100.0 * len(ok) / len(rows), 2) if rows else 0.0,
         "by_status": by_status,
         "with_location": sum(1 for link in ok if row_location(by_link[link])),
-        "delay_min": delays[0] if delays else None,
-        "delay_median": delays[len(delays) // 2] if delays else None,
-        "delay_max": delays[-1] if delays else None,
+        **_delay_summary(ok, by_link),
     }
     if unknown_status:
-        # وضعیتِ ناشناخته خطا نیست، ولی باید دیده شود: سنجشِ ما فقط چهار
-        # مقدار را ثبت کرده و پنجمی یعنی بالادست چیزی را عوض کرده است.
+        # Not an error, but it must be visible: only four statuses were ever
+        # measured, so a fifth means upstream changed something.
         stats["unknown_status"] = unknown_status
     return {"ok": ok, "failed": failed, "broken": broken,
             "rows": by_link, "stats": stats}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# اجرا
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+# Execution
+# --------------------------------------------------------------------------- #
 
 def resolve_binary(binary: Optional[str] = None) -> str:
-    """مسیرِ اجراییِ ابزار، یا `XrayKnifeMissing`."""
+    """Absolute path of the tool, or raise :class:`XrayKnifeMissing`."""
     name = binary or XK_BIN
     if os.path.sep in name:
         if os.path.isfile(name) and os.access(name, os.X_OK):
             return os.path.abspath(name)
-        raise XrayKnifeMissing(
-            f"xray-knife is not an executable file at {name!r}")
+        raise XrayKnifeMissing(f"xray-knife is not an executable file at {name!r}")
     found = shutil.which(name)
     if not found:
         raise XrayKnifeMissing(
@@ -419,6 +368,16 @@ def _non_blank_count(path: str) -> int:
         return sum(1 for line in handle if line.strip())
 
 
+def _unique_links(path: str) -> List[str]:
+    seen: Dict[str, None] = {}
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            text = line.strip()
+            if text:
+                seen.setdefault(text, None)
+    return list(seen)
+
+
 def build_argv(in_path: str, out_path: str, *,
                binary: str,
                test_url: Optional[str] = None,
@@ -427,30 +386,116 @@ def build_argv(in_path: str, out_path: str, *,
                timeout_ms: Optional[int] = None,
                max_passed: int = 0,
                retries: int = 0) -> List[str]:
-    """
-    خطِ فرمانِ کامل. هیچ پرچمی به پیش‌فرض واگذار نمی‌شود مگر آن‌که
-    پیش‌فرضش سنجیده و پذیرفته شده باشد.
+    """Full command line. No flag is left to its default unless that default was
+    measured and accepted.
 
-    `--rip` عمداً دست‌کاری نمی‌شود: پیش‌فرضش `true` است و سنجشِ A/B نشان
-    داد با `--rip=false` ستونِ `location` در **صفر** سطر پر می‌شود، که
-    بندِ B6b (کشور از xray-knife) را ناممکن می‌کند.
+    ``--rip`` is deliberately untouched: it defaults to true, and an A/B run
+    showed --rip=false leaves the location column empty in every row, which makes
+    country-from-xray-knife impossible.
     """
     argv = [
         binary, "http",
         "-f", in_path,
         "-x", "csv",
         "-o", out_path,
-        "-t", str(int(threads if threads is not None else THREADS)),
-        "-d", str(int(mdelay_ms if mdelay_ms is not None else MDELAY_MS)),
-        "--timeout", str(int(timeout_ms if timeout_ms is not None
-                             else TIMEOUT_MS)),
-        "-u", test_url if test_url is not None else TEST_URL,
+        "-t", str(int(THREADS if threads is None else threads)),
+        "-d", str(int(MDELAY_MS if mdelay_ms is None else mdelay_ms)),
+        "--timeout", str(int(TIMEOUT_MS if timeout_ms is None else timeout_ms)),
+        "-u", TEST_URL if test_url is None else test_url,
     ]
     if max_passed:
         argv += ["--max-passed", str(int(max_passed))]
     if retries:
         argv += ["--retries", str(int(retries))]
     return argv
+
+
+def _require_usable_input(in_path: str) -> int:
+    """Number of non-blank lines, or raise :class:`EmptyInput`.
+
+    Runs before the binary is resolved. The check is free and it closes the hang
+    path, so ordering it first means the anti-hang guard is still exercised on a
+    machine that does not have the tool installed.
+    """
+    if not os.path.isfile(in_path):
+        raise EmptyInput(
+            f"input file does not exist: {in_path!r}. Measured: xray-knife then "
+            f"falls back to reading stdin and blocks forever (rc=124 under CI's "
+            f"open stdin).")
+    lines = _non_blank_count(in_path)
+    if lines == 0:
+        raise EmptyInput(
+            f"input file has no non-blank line: {in_path!r}. Measured: an empty "
+            f"file makes xray-knife wait on stdin (rc=124 under CI's open "
+            f"stdin). This is exactly what happens when L2 leaves zero open "
+            f"endpoints, so it must be handled, not hoped away.")
+    return lines
+
+
+def _prepare_output(out_path: Optional[str]) -> Tuple[str, bool]:
+    """Return ``(path, owned)`` with the parent created and stale output removed.
+
+    Ownership matters for cleanup: a caller-supplied path belongs to the caller
+    and must survive, while a path we created with mkstemp is ours and must be
+    removed on every exit path. Leak measured before this split: one leftover
+    l3_*.csv per run without out_path, three per L3_ROUNDS=3 pipeline round, plus
+    one on each exception path.
+
+    Stale output is removed before the run because a failed run leaves the
+    previous file intact, and it would then be read as fresh results.
+    """
+    owned = out_path is None
+    if owned:
+        handle, out_path = tempfile.mkstemp(prefix="l3_", suffix=".csv")
+        os.close(handle)
+    assert out_path is not None
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    if os.path.exists(out_path):
+        os.remove(out_path)
+    return out_path, owned
+
+
+def _execute(argv: Sequence[str], limit: int) -> Tuple[str, float]:
+    """Run the tool and return ``(output, elapsed_sec)``.
+
+    ``stdin=DEVNULL`` is the second anti-hang defence and the timeout is the
+    third. A non-zero exit or a timeout raises :class:`XrayKnifeFailed`.
+    """
+    started = time.time()
+    try:
+        proc = subprocess.run(
+            list(argv),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=limit,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise XrayKnifeFailed(
+            f"xray-knife did not finish within {limit}s. The measured full "
+            f"census of 3,845 configs took 43s, so this is not slowness - it is "
+            f"a stuck run."
+        ) from exc
+    elapsed = round(time.time() - started, 2)
+    output = (proc.stdout or b"").decode("utf-8", errors="replace")
+    if proc.returncode != 0:
+        raise XrayKnifeFailed(
+            f"xray-knife exited {proc.returncode}.\n"
+            f"--- last output ---\n{output[-2000:]}")
+    return output, elapsed
+
+
+def _read_result(out_path: str, output: str) -> Dict[str, Any]:
+    """Verify the file exists, then parse and classify it."""
+    if not os.path.isfile(out_path):
+        raise OutputNotWritten(
+            f"xray-knife exited 0 but wrote no file at {out_path!r}. Measured: "
+            f"with a missing parent directory it prints 'Results have been saved "
+            f"to ...' and creates nothing.\n"
+            f"--- last output ---\n{output[-2000:]}")
+    with open(out_path, encoding="utf-8", errors="replace") as handle:
+        return classify(parse_csv(handle.read()))
 
 
 def run_test(in_path: str, *,
@@ -463,129 +508,51 @@ def run_test(in_path: str, *,
              max_passed: int = 0,
              retries: int = 0,
              hard_timeout: Optional[int] = None) -> Dict[str, Any]:
+    """Run L3 over an input file and return the graded result.
+
+    Step order, each step behind a measurement (see the module docstring)::
+
+        1 input exists and is non-blank        -> EmptyInput
+        2 binary resolved                      -> XrayKnifeMissing
+        3 output parent created, stale removed
+        4 run with stdin=DEVNULL and a hard timeout -> XrayKnifeFailed
+        5 output file verified                 -> OutputNotWritten
+        6 CSV parsed with the csv module and graded -> MalformedCsv
+
+    ``partial`` means the CSV has fewer rows than the input had unique links. A
+    missing link must never be read as a failure: --max-passed truncates output,
+    and the tool also drops duplicates itself.
+
+    ``out_path`` is still reported for contract stability, but when this function
+    created the file it no longer exists on disk by the time you read the key.
     """
-    L3 را روی یک فایلِ ورودی اجرا می‌کند و نتیجهٔ داوری‌شده را برمی‌گرداند.
-
-    ترتیبِ گام‌ها هرکدام پشتِ یک سنجشِ زنده است:
-
-      ۱) ورودی باید باشد *و* سطرِ ناتهی داشته باشد → EmptyInput
-         (بی این گام: rc=124، قفل تا سقفِ ۶ ساعتِ GitHub)
-      ۲) باینری حل می‌شود                        → XrayKnifeMissing
-      ۳) پوشهٔ والدِ خروجی ساخته می‌شود
-         (بی این گام: rc=0 با پیامِ موفقیت و **بی هیچ فایلی**)
-      ۴) خروجیِ کهنه حذف می‌شود
-         (بی این گام: دادهٔ اجرایِ قبلی «نتیجهٔ تازه» خوانده می‌شود)
-      ۵) اجرا با `stdin=DEVNULL` و مهلتِ سختِ پایتونی
-      ۶) وجودِ فایلِ خروجی تأیید می‌شود          → OutputNotWritten
-      ۷) CSV با ماژولِ `csv` خوانده و داوری می‌شود
-
-    کلیدِ `partial` یعنی «تعدادِ سطرها از تعدادِ لینک‌های یکتایِ ورودی کمتر
-    است». هرگز نباید نبودِ یک لینک را «شکست خورد» خواند: سنجشِ
-    `--max-passed 2 -t 5` پنج سطر داد (۲ موفق + ۳ نیمه‌کاره)، و خودِ ابزار
-    هم تکراری‌ها را حذف می‌کند («Removed 2 duplicate config link(s)»).
-    """
-    # ترتیب مهم است: بررسیِ ورودی **پیش از** یافتنِ باینری می‌آید. بررسیِ
-    # ورودی رایگان است و مسیرِ قفل‌شدن را می‌بندد؛ اگر جای این دو عوض شود،
-    # روی ماشینی که ابزار را ندارد قفلِ ضدِ‌hang هرگز آزموده نمی‌شود — و
-    # همین ترتیبِ اشتباه در نسخهٔ اولِ این تابع بود و آزمونِ واحد گرفتش.
-    if not os.path.isfile(in_path):
-        raise EmptyInput(
-            f"input file does not exist: {in_path!r}. Measured: xray-knife "
-            f"then falls back to reading stdin and blocks forever (rc=124 "
-            f"under CI's open stdin).")
-    n_lines = _non_blank_count(in_path)
-    if n_lines == 0:
-        raise EmptyInput(
-            f"input file has no non-blank line: {in_path!r}. Measured: an "
-            f"empty file makes xray-knife wait on stdin (rc=124 under CI's "
-            f"open stdin). This is exactly what happens when L2 leaves zero "
-            f"open endpoints, so it must be handled, not hoped away.")
-
+    n_lines = _require_usable_input(in_path)
     resolved = resolve_binary(binary)
-
-    # مالکیتِ فایلِ خروجی (F-3)
-    # ─────────────────────────
-    # اگر فراخوان مسیر داده باشد، فایل **مالِ اوست** و ما حق نداریم پاکش
-    # کنیم؛ اگر ما خودمان با `mkstemp` ساختیم، مالِ ماست و باید در هر مسیرِ
-    # خروج — موفق یا استثنا — پاکش کنیم. تفکیکِ این دو حالت با همین پرچم
-    # انجام می‌شود، نه با حدس‌زدن از رویِ نامِ فایل.
-    #
-    # اندازه‌گیریِ نشت (پیش از درمان، با باینریِ شبیه‌سازِ xray-knife):
-    #   • هر `test_lines`/`run_test` بی‌`out_path`  → ۱ فایلِ `l3_*.csv` جا می‌ماند
-    #   • `pipeline.run_l3_round` با L3_ROUNDS=3   → ۳ فایل در هر دور
-    #   • مسیرهای استثنا هم نشت داشتند: rc≠۰ و CSVِ بدشکل هرکدام ۱ فایل
-    #     (مسیرهای «فایل نوشته نشد» و «مهلت» و «باینریِ غایب» و «ورودیِ تهی»
-    #      طبعاً چیزی جا نمی‌گذاشتند، ولی حالا همه یکسان پوشش دارند)
-    # چون هر اجرایِ CI یک دورِ L3 دارد، این نشت خاموش و انباشتی بود.
-    owned = out_path is None
-    if owned:
-        handle, out_path = tempfile.mkstemp(prefix="l3_", suffix=".csv")
-        os.close(handle)
-    parent = os.path.dirname(os.path.abspath(out_path))
-    os.makedirs(parent, exist_ok=True)
-    if os.path.exists(out_path):
-        os.remove(out_path)
+    out_path, owned = _prepare_output(out_path)
 
     try:
         argv = build_argv(in_path, out_path, binary=resolved,
                           test_url=test_url, threads=threads,
                           mdelay_ms=mdelay_ms, timeout_ms=timeout_ms,
                           max_passed=max_passed, retries=retries)
-        limit = int(hard_timeout if hard_timeout is not None else HARD_TIMEOUT)
-
-        started = time.time()
-        try:
-            proc = subprocess.run(
-                argv,
-                stdin=subprocess.DEVNULL,   # لایهٔ دومِ دفاع در برابرِ قفل
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=limit,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise XrayKnifeFailed(
-                f"xray-knife did not finish within {limit}s. The measured full "
-                f"census of 3,845 configs took 43s, so this is not slowness — "
-                f"it is a stuck run."
-            ) from exc
-        elapsed = round(time.time() - started, 2)
-        output = (proc.stdout or b"").decode("utf-8", errors="replace")
-
-        if proc.returncode != 0:
-            raise XrayKnifeFailed(
-                f"xray-knife exited {proc.returncode}.\n"
-                f"--- last output ---\n{output[-2000:]}")
-
-        if not os.path.isfile(out_path):
-            raise OutputNotWritten(
-                f"xray-knife exited 0 but wrote no file at {out_path!r}. "
-                f"Measured: with a missing parent directory it prints 'Results "
-                f"have been saved to ...' and creates nothing.\n"
-                f"--- last output ---\n{output[-2000:]}")
-
-        with open(out_path, encoding="utf-8", errors="replace") as handle:
-            result = classify(parse_csv(handle.read()))
+        limit = int(HARD_TIMEOUT if hard_timeout is None else hard_timeout)
+        output, elapsed = _execute(argv, limit)
+        result = _read_result(out_path, output)
 
         unique_in = _unique_links(in_path)
         result["partial"] = len(result["rows"]) < len(unique_in)
-        result["stats"]["elapsed_sec"] = elapsed
-        result["stats"]["lines_in"] = n_lines
-        result["stats"]["unique_in"] = len(unique_in)
-        result["stats"]["test_url"] = (
-            test_url if test_url is not None else TEST_URL)
-        result["stats"]["threads"] = int(
-            threads if threads is not None else THREADS)
-        # `out_path` هم‌چنان گزارش می‌شود تا قرارداد نشکند، ولی اگر مالِ ما
-        # بوده باشد دیگر روی دیسک نیست. هیچ مصرف‌کننده‌ای در پروژه این کلید
-        # را نمی‌خواند (شمرده شد: ۰ مورد بیرونِ همین ماژول)، پس حذفِ فایل
-        # چیزی را نمی‌شکند؛ نگه‌داشتنِ کلید فقط برای سازگاری است.
+        result["stats"].update(
+            elapsed_sec=elapsed,
+            lines_in=n_lines,
+            unique_in=len(unique_in),
+            test_url=TEST_URL if test_url is None else test_url,
+            threads=int(THREADS if threads is None else threads),
+        )
         result["out_path"] = out_path
         return result
     finally:
-        # `finally` عمداً بیرونِ همهٔ شاخه‌هاست: هر استثنایی هم که رد شود،
-        # فایلِ موقتِ خودمان می‌رود. `try/except OSError` لازم است چون پاک‌سازی
-        # هرگز نباید علتِ اصلیِ خطا را بپوشاند.
+        # Outside every branch on purpose: our temp file goes even when an
+        # exception propagates, and cleanup must never mask the original error.
         if owned:
             try:
                 os.remove(out_path)
@@ -593,18 +560,8 @@ def run_test(in_path: str, *,
                 pass
 
 
-def _unique_links(path: str) -> List[str]:
-    seen: Dict[str, None] = {}
-    with open(path, encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            text = line.strip()
-            if text:
-                seen.setdefault(text, None)
-    return list(seen)
-
-
 def test_lines(lines: Iterable[str], **kwargs: Any) -> Dict[str, Any]:
-    """L3 روی سطرهای در حافظه. ورودی به یک فایلِ موقت نوشته می‌شود."""
+    """L3 over in-memory lines. Written to a temp file first."""
     handle, path = tempfile.mkstemp(prefix="l3_in_", suffix=".txt")
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as out:
@@ -626,15 +583,14 @@ def test_file(path: str, **kwargs: Any) -> Dict[str, Any]:
 
 def _main(argv: Sequence[str]) -> int:
     import json
+
     if len(argv) < 2:
         print(f"usage: {os.path.basename(argv[0])} <configs.txt> [out.csv]",
               file=sys.stderr)
         return 64
-    in_path = argv[1]
-    out_path = argv[2] if len(argv) > 2 else None
 
     try:
-        result = test_file(in_path, out_path=out_path)
+        result = test_file(argv[1], out_path=argv[2] if len(argv) > 2 else None)
     except (XrayKnifeMissing, EmptyInput) as exc:
         print(f"!! {exc}", file=sys.stderr)
         return 2
