@@ -1,57 +1,43 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-آبشارِ چهارلایه — هماهنگ‌کننده (بندهای B5/B6/B7/B8 فاز B).
+"""Four-layer verification cascade: the orchestrator.
 
-این ماژول لایه‌های موجود را **می‌چیند**، نه آن‌که منطقشان را تکرار کند:
+This module *arranges* the existing layers, it does not restate their logic::
 
-    L0/L1  filters.py       حذفِ ساختاریِ بی‌شبکه + یکتاسازیِ نقطهٔ پایانی
-    L2     reachability.py  دست‌دادنِ TCP
-    L3     realtest.py      آزمونِ واقعیِ پروکسی با xray-knife
-    ↓
-    verified/ · fast/ · secure/ · top100.txt
+    L0/L1  filters.py       offline structural drop + endpoint dedup
+    L2     reachability.py  TCP handshake
+    L3     realtest.py      real proxy test via xray-knife
+    ->     verified/ . fast/ . secure/ . top100.txt
 
-چهار تصمیمِ **سنجیده** که این فایل را شکل می‌دهند:
+Four measured decisions shape this file.
 
-۱) «پایدار» = موفق در **همهٔ** اجراهای یک دور، با **۳** اجرا.
-   سنجش (B4b، ۵ اجرای کامل، **در سندباکس**): موفق‌ها ۵۰۱/۴۷۳/۳۶۳/۴۴۲/۴۷۳ —
-   میانگین ۴۵۰٫۴، انحرافِ معیار ۵۳٫۱، دامنه ۱۳۸ (۳۰٫۶٪). از ۶۲۶ کانفیگی که
-   **دست‌کم یک بار** کار کرد، تنها ۲۲۴ **همیشه** کار کرد ⇒ ۶۴٫۲۲٪ لرزان.
-   اعتبارسنجیِ leave-one-out (آموزش روی ۴ اجرا، آزمون روی پنجمی):
-       ۱-از-۴ → ۶۱۱ کانفیگ · دقت ۷۱٫۳٪ · بازخوانی ۹۶٫۸٪
-       ۲-از-۴ → ۵۲۰ کانفیگ · دقت ۷۷٫۸٪ · بازخوانی ۸۹٫۹٪
-       ۳-از-۴ → ۴۱۶ کانفیگ · دقت ۸۳٫۷٪ · بازخوانی ۷۷٫۵٪
-       ۴-از-۴ → ۲۵۵ کانفیگ · دقت ۸۸٫۵٪ · بازخوانی ۵۰٫۴٪
-       یک اجرا (مبنا) → ۴۵۰ کانفیگ · دقت ۷۸٫۶٪
+1. "Stable" means passing in *every* run of a round, and a round is 3 runs.
+   Over 5 full sandbox runs the pass counts were 501/473/363/442/473 (mean
+   450.4, stdev 53.1, range 30.6%). Of 626 configs that worked at least once,
+   only 224 always worked, i.e. 64.22% flaky. Leave-one-out validation:
+   1-of-4 -> 611 configs, 71.3% precision; 2-of-4 -> 520, 77.8%;
+   3-of-4 -> 416, 83.7%; 4-of-4 -> 255, 88.5%; single run baseline 450, 78.6%.
 
-   ⚠️ **آن ۶۴٫۲۲٪ عددِ محیط است، نه ثابتِ قاعده.** همان کد روی یک سرورِ
-   اختصاصی (۸۱۵۸ کانفیگِ یکسان، ۳ اجرا) سنجیده شد: موفق‌ها ۵۴۲/۵۳۱/۵۳۲
-   (انحرافِ معیار ≈۶ در برابر ۵۳)، پایدار ۴۵۸ در برابر ۲۲۴، لرزان
-   **۲۴٫۹۲٪** در برابر ۶۴٫۲۲٪. یعنی بخشِ بزرگی از آن لرزش، شبکهٔ سندباکس
-   بود و نه کانفیگ‌ها. **قاعده** («موفق در همهٔ اجراها») از هر دو سنجش
-   سالم بیرون آمد؛ فقط *درصد* را نباید مطلق خواند. هر خروجی درصدِ
-   **همان اجرا** را در سرآیندِ خود می‌نویسد (`stats['flaky_pct']`).
+   That 64.22% is an environment number, not a property of the rule. The same
+   code on a dedicated server (same 8,158 configs, 3 runs) gave 542/531/532,
+   stdev ~6 instead of 53, and 24.92% flaky. The rule survived both
+   measurements; only the percentage is local, so every output writes its own
+   run's figure into its header via stats['flaky_pct'].
 
-   هزینه: سنجشِ اجراشده روی سرور ⇒ L3 سه اجرا **۱۰۶٫۹۲s** و کلِ آبشار
-   (L0/L1 + L2 + سه اجرای L3) **۱۴۹٫۳۴s** از بودجهٔ ۹۰۰ ثانیه‌ایِ CI،
-   کندترین اجرا ۳۶٫۲۱s ⇒ جا می‌شود. (ادعای پیشینِ «۳×۴۴s ≈ ۱۳۲s» در همین
-   docstring **غلط** بود: آن ۴۴s از سریع‌ترین اجرای سندباکس برداشته شده
-   بود، در حالی که فاصلهٔ واقعیِ اجراهای B4b ۵۴/۳۴۵/۶۱۵/۴۰۴ ثانیه بود.)
-   روی اجراهای ۱–۳ سندباکس عدداً **۲۸۱** کانفیگ می‌داد و روی سرور ۴۵۸ —
-   هر دو بیش از ۱۰۰ موردِ لازم برای `top100.txt`.
+   Cost on the server: three L3 runs 106.92s, whole cascade 149.34s against a
+   900s CI budget.
 
-۲) پذیرشِ یک ردیف **چهار** شرط دارد، نه یکی. `success == total` تنها **سوراخ**
-   است: برای همهٔ ۸۷ ردیفِ `broken` هم درست است (۰ == ۰). قاعده در
-   `realtest.is_row_genuinely_ok` است و این‌جا **بازنویسی نمی‌شود**.
+2. Accepting a row takes four conditions, not one. `success == total` alone is a
+   hole: it is also true for all 87 broken rows (0 == 0). The rule lives in
+   realtest.is_row_genuinely_ok and is not restated here.
 
-۳) `fast` با **میانهٔ چند اجرا** سنجیده می‌شود، نه یک اجرا. سنجش: میانهٔ هر
-   اجرا ۷۶۱/۷۲۰/۷۶۸/۷۵۶/۷۶۵ms (میانگین ۷۵۴، انحرافِ معیار فقط ۲۰) — یعنی
-   *توزیع* پایدار است. ولی **۷۷ کانفیگ (۳۴٫۴٪) خطِ ۸۰۰ms را بینِ اجراها رد و
-   بدل می‌کنند** (میانهٔ دامنهٔ درون‌لینکی ۳۷۳ms = ۵۷٫۲٪). پس برچسبِ تک‌اجرا
-   بی‌اعتبار است.
+3. `fast` is judged on the median across runs, not one run. Per-run medians were
+   761/720/768/756/765ms (stdev 20), so the *distribution* is stable, but 77
+   configs (34.4%) cross the 800ms line between runs (median intra-link range
+   373ms). A single-run label is therefore not trustworthy.
 
-۴) `secure` = **محرمانگیِ پیشرو**، نه «هر رمزنگاری». مستندِ کاملِ استدلال و سه
-   اثباتِ اجراشده در `PHASE_B_PLAN.md` بندِ B7؛ خلاصه در `has_forward_secrecy`.
+4. `secure` means forward secrecy, not "any encryption". See
+   has_forward_secrecy() for the summary and PHASE_B_PLAN.md B7 for the proofs.
 """
 
 from __future__ import annotations
@@ -62,43 +48,42 @@ import os
 import statistics
 import sys
 import time
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import realtest  # noqa: E402
-import reachability  # noqa: E402
-import filters  # noqa: E402
 import converters  # noqa: E402
 import core  # noqa: E402
+import filters  # noqa: E402
+import reachability  # noqa: E402
+import realtest  # noqa: E402
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ثابت‌ها
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+# Constants
+# --------------------------------------------------------------------------- #
 
-#: تعدادِ اجراهای L3 در هر دور. «پایدار» = موفق در *همهٔ* این اجراها.
-#: سنجش (B4b): ۳ اجرا ⇒ ۲۸۱ کانفیگ روی اجراهای ۱–۳ و ~۱۳۲ ثانیه هزینه.
+#: L3 runs per round. "Stable" means passing in all of them.
 L3_ROUNDS = int(os.environ.get("L3_ROUNDS", "3"))
 
-#: آستانهٔ `fast` بر پایهٔ **میانهٔ** چند اجرا (میلی‌ثانیه).
-#: سنجش روی مجموعهٔ پایدار: ۳۰۰ms→۱۴ کانفیگ (۶٫۲٪، بی‌فایده) · ۵۰۰→۸۶ ·
-#: ۶۰۰→۱۱۱ · **۸۰۰→۱۴۹ (۶۶٫۵٪)** · ۱۰۰۰→۱۶۸ · ۱۲۰۰→۱۸۲.
+#: `fast` threshold on the median delay across runs, in ms. Measured on the
+#: stable set: 300 -> 14 configs (useless), 500 -> 86, 600 -> 111,
+#: 800 -> 149 (66.5%), 1000 -> 168, 1200 -> 182.
 FAST_THRESHOLD_MS = int(os.environ.get("L3_FAST_MS", "800"))
 
-#: سقفِ `top100.txt`. اگر کمتر از این تعداد پایدار بود، فایل با تعدادِ
-#: **واقعی** منتشر می‌شود؛ پرکردنِ مصنوعی با کانفیگِ نیازموده ممنوع است.
+#: Cap for top100.txt. If fewer configs qualify, the real count is published;
+#: padding with untested configs is forbidden.
 TOP_N = int(os.environ.get("L3_TOP_N", "100"))
 
-#: مقادیرِ `tls` که دست‌دادنِ (EC)DHE و در نتیجه محرمانگیِ پیشرو را می‌رسانند.
+#: `tls` values that imply an (EC)DHE handshake, hence forward secrecy.
 FS_TLS_VALUES = frozenset({"tls", "reality", "xtls"})
 
-#: پروتکل‌هایی که روی QUIC سوارند ⇒ TLS 1.3 اجباری (RFC 9001 §4.2:
-#: «Clients MUST NOT offer TLS versions older than 1.3»).
+#: QUIC-based protocols, where TLS 1.3 is mandatory (RFC 9001 section 4.2:
+#: "Clients MUST NOT offer TLS versions older than 1.3").
 FS_SCHEMES = frozenset({"hysteria2", "hy2", "tuic"})
 
-#: پارامترهایی که با آن‌ها خودِ لینک اعتبارسنجیِ گواهی را کنار می‌گذارد.
-#: چنین لینکی هرچند TLS دارد، در برابرِ MITM محافظت ندارد.
+#: Parameters with which a link waives certificate validation. Such a link has
+#: TLS but no MITM protection.
 INSECURE_KEYS = frozenset({
     "insecure", "allowinsecure", "allow_insecure",
     "skip-cert-verify", "skipcertverify", "allowinsecureciphers",
@@ -107,14 +92,18 @@ _TRUEISH = frozenset({"1", "true", "yes", "on"})
 
 CATEGORIES = ("verified", "fast", "secure")
 
+#: Sentinel rank for a stable config with no recorded delay. Should not happen,
+#: but it must sort last rather than vanish silently.
+_NO_DELAY = 10 ** 9
+
 
 class StabilityError(RuntimeError):
-    """دورِ آزمون نتوانست هیچ اجرای معتبری تولید کند — خطای محیط، نه داده."""
+    """The round produced no valid run. An environment fault, not a data one."""
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# داوریِ امنیت
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+# Security judgement
+# --------------------------------------------------------------------------- #
 
 def scheme_of(link: str) -> str:
     return link.split("://", 1)[0].strip().lower() if "://" in link else ""
@@ -125,37 +114,35 @@ def _query(link: str) -> Dict[str, str]:
         raw = parse_qs(urlsplit(link).query)
     except ValueError:
         return {}
-    return {k.strip().lower(): (v[0] if v else "") for k, v in raw.items()}
+    return {key.strip().lower(): (val[0] if val else "")
+            for key, val in raw.items()}
 
 
 def declares_insecure(link: str) -> bool:
-    """آیا خودِ لینک اعتبارسنجیِ گواهی را غیرفعال می‌کند؟"""
-    q = _query(link)
-    for key in INSECURE_KEYS:
-        if unquote(q.get(key, "")).strip().lower() in _TRUEISH:
-            return True
-    return False
+    """Whether the link itself disables certificate validation."""
+    query = _query(link)
+    return any(unquote(query.get(key, "")).strip().lower() in _TRUEISH
+               for key in INSECURE_KEYS)
 
 
 def has_forward_secrecy(link: str, tls_value: str) -> bool:
-    """
-    آیا کلیدِ نشست از (EC)DHE می‌آید؟
+    """Whether the session key comes from an (EC)DHE handshake.
 
-    چرا این معیار و نه «هر رمزنگاری»؟ چون این مخزن **عمومی** است. سه اثباتِ
-    اجراشده (`/home/user/exp/b7_proof.py` و `b7_final.py`):
+    Why this bar and not "any encryption": this repo is public, so a pre-shared
+    key that is printed in the link protects nothing. Three executed proofs:
 
-      * `ss` با رمزِ AEAD: `salt` روی سیم بازمتن است و کلیدِ اصلی از رمزِ
-        داخلِ همان لینکِ منتشرشده مشتق می‌شود ⇒ ناظری که فقط لینک را دارد
-        متنِ اصلی را باز کرد (۳/۳ رمز). SIP022 هم صریح است:
-        «Shadowsocks 2022 does not provide forward secrecy».
-      * `vmess` بی‌TLS: کلیدِ بخشِ فرمان `MD5(UUID ‖ ثابتِ عمومی)` است و آن
-        بخش خودش کلیدِ دادهٔ نشست را دارد ⇒ با UUIDِ منتشرشده و ۶۱ بار MD5
-        (پنجرهٔ ±۳۰ ثانیه) کلیدِ نشست بازیافت شد.
-      * `vless` با `tls=none`: مشخصهٔ VLESS `encryption` را «تنها `none`»
-        می‌پذیرد ⇒ واقعاً بی‌رمز.
+    - shadowsocks with an AEAD cipher: the salt is plaintext on the wire and the
+      main key derives from the password inside the published link, so an
+      observer holding only the link recovered the plaintext (3/3 ciphers).
+      SIP022 is explicit: "Shadowsocks 2022 does not provide forward secrecy".
+    - vmess without TLS: the command-section key is MD5(UUID + public constant)
+      and that section carries the session data key, so the session key was
+      recovered from the published UUID with 61 MD5 attempts (a 30 second window).
+    - vless with tls=none: the VLESS spec only accepts `encryption=none`, so it
+      really is unencrypted.
 
-    این کانفیگ‌ها «خراب» نیستند و در `verified/` می‌مانند؛ فقط برچسبِ «امن»
-    برایشان در یک مخزنِ عمومی نادرست است.
+    These configs are not broken and stay in verified/. Only the "secure" label
+    would be false for them in a public repo.
     """
     if (tls_value or "").strip().lower() in FS_TLS_VALUES:
         return True
@@ -166,22 +153,21 @@ def is_secure(link: str, tls_value: str) -> bool:
     return has_forward_secrecy(link, tls_value) and not declares_insecure(link)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# دورِ چندباره‌ی L3
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+# Multi-run L3 round
+# --------------------------------------------------------------------------- #
 
 def _median_int(values: Sequence[int]) -> int:
     return int(round(statistics.median(values)))
 
 
 def _rows_of(result: Dict[str, Any]) -> List[Dict[str, str]]:
-    """
-    ردیف‌های یک اجرای L3 را برمی‌گرداند.
+    """Rows of one L3 run, normalising the container shape in one place.
 
-    `realtest.run_test` کلیدِ `rows` را **نقشهٔ لینک→ردیف** می‌دهد. اتکا به
-    پیمایشِ مستقیمِ آن، کلیدهای رشته‌ای می‌دهد و در اجرای واقعی می‌شکند؛ این
-    تابع قرارداد را در **یک نقطه** متمرکز می‌کند و شکلِ ناشناخته را خاموش رد
-    نمی‌کند، بلکه بلند می‌شکند.
+    `realtest.run_test` returns `rows` as a link -> row *mapping*. Iterating it
+    directly yields string keys and fails at runtime with "'str' object has no
+    attribute 'get'", which once passed the test suite because a test shim
+    returned the wrong shape. An unknown shape breaks loudly here.
     """
     rows = result.get("rows")
     if isinstance(rows, dict):
@@ -194,57 +180,48 @@ def _rows_of(result: Dict[str, Any]) -> List[Dict[str, str]]:
 
 def run_l3_round(lines: Sequence[str], rounds: Optional[int] = None,
                  **kwargs: Any) -> Dict[str, Any]:
-    """
-    L3 را `rounds` بار روی همان ورودی اجرا می‌کند و پایداری را می‌سنجد.
+    """Run L3 ``rounds`` times over the same input and measure stability.
 
-    خروجی:
-        rounds       : تعدادِ اجراهای انجام‌شده
-        per_run_ok   : تعدادِ موفقِ هر اجرا (برای تلمتری و کشفِ رگرسیون)
-        stable       : لینک‌هایی که در **همهٔ** اجراها پذیرفته شدند
-        ever_ok      : لینک‌هایی که دست‌کم یک بار پذیرفته شدند
-        delays       : لینکِ پایدار → میانهٔ تأخیر در اجراها
-        tls          : لینک → مقدارِ `tls` (ایستا؛ در ۰ از ۳٬۸۴۵ ردیف تغییر کرد)
-        flaky_pct    : درصدِ لرزان از میانِ هرچه کار کرد
+    Returns::
+
+        rounds      runs performed
+        per_run_ok  pass count per run, for telemetry and regression spotting
+        stable      links accepted in *every* run
+        ever_ok     links accepted at least once
+        delays      stable link -> median delay across runs
+        tls         link -> tls value (static: changed in 0 of 3,845 rows)
+        flaky_pct   share of everything that worked which was not stable
     """
     if rounds is None:
         rounds = L3_ROUNDS
     if rounds < 1:
         raise ValueError(f"rounds must be >= 1, got {rounds!r}")
 
-    lines = [ln.strip() for ln in lines if (ln or "").strip()]
+    lines = [line.strip() for line in lines if (line or "").strip()]
     if not lines:
-        # همان درسِ لایهٔ L3: ورودیِ تهی باید **بلند** بشکند، نه خاموش.
+        # Same lesson as L3 itself: empty input breaks loudly, never silently.
         raise realtest.EmptyInput("no configs to test at L3")
 
-    ok_sets: List[set] = []
+    ok_sets: List[Set[str]] = []
     per_run_ok: List[int] = []
     delays: Dict[str, List[int]] = {}
     tls_of: Dict[str, str] = {}
 
     for _ in range(rounds):
-        res = realtest.test_lines(lines, **kwargs)
-        # قرارداد سنجیده‌شده: `realtest` مقدارِ `rows` را **نقشهٔ لینک→ردیف**
-        # می‌دهد (خطِ ۳۹۳: `"rows": by_link`). پیمایشِ مستقیمِ یک dict کلیدها را
-        # می‌دهد که رشته‌اند، نه ردیف. این اشتباه در اجرای واقعی با
-        # `'str' object has no attribute 'get'` شکست — در حالی که آزمون‌ها سبز
-        # بودند، چون شیمِ آزمون شکلِ نادرستی می‌داد. `.values()` صریح است و
-        # `_rows_of` هر دو شکل را می‌پذیرد تا قرارداد یک‌جا کنترل شود.
-        ok_now = set()
-        for row in _rows_of(res):
+        result = realtest.test_lines(lines, **kwargs)
+        passing: Set[str] = set()
+        for row in _rows_of(result):
             link = (row.get("link") or "").strip()
             if not link:
                 continue
             tls_of.setdefault(link, realtest.row_tls(row))
             if realtest.is_row_genuinely_ok(row):
-                ok_now.add(link)
-                d = realtest.row_delay_ms(row)
-                if d is not None:
-                    delays.setdefault(link, []).append(d)
-        ok_sets.append(ok_now)
-        per_run_ok.append(len(ok_now))
-
-    if not ok_sets:
-        raise StabilityError("no L3 run produced a result set")
+                passing.add(link)
+                delay = realtest.row_delay_ms(row)
+                if delay is not None:
+                    delays.setdefault(link, []).append(delay)
+        ok_sets.append(passing)
+        per_run_ok.append(len(passing))
 
     stable = set.intersection(*ok_sets)
     ever_ok = set.union(*ok_sets)
@@ -256,8 +233,9 @@ def run_l3_round(lines: Sequence[str], rounds: Optional[int] = None,
         "per_run_ok": per_run_ok,
         "stable": stable,
         "ever_ok": ever_ok,
-        # تنها میانهٔ لینک‌های پایدار معنا دارد؛ بقیه نمونهٔ کامل ندارند.
-        "delays": {L: _median_int(delays[L]) for L in stable if L in delays},
+        # Only stable links have a full sample, so only they get a median.
+        "delays": {link: _median_int(delays[link])
+                   for link in stable if link in delays},
         "tls": tls_of,
         "flaky_pct": flaky_pct,
     }
@@ -266,11 +244,10 @@ def run_l3_round(lines: Sequence[str], rounds: Optional[int] = None,
 def build_buckets(round_result: Dict[str, Any],
                   fast_ms: Optional[int] = None,
                   top_n: Optional[int] = None) -> Dict[str, Any]:
-    """
-    از نتیجهٔ دور، سه سبد + `top100` را می‌سازد.
+    """Turn a round result into the three buckets plus top100.
 
-    مرتب‌سازی همه‌جا بر **میانهٔ تأخیر** است و برای تأخیرهای مساوی بر خودِ
-    لینک — تا خروجی **بازتولیدپذیر** باشد و در git تفاوتِ کاذب نسازد.
+    Ordering is by median delay, then by the link itself, so equal delays keep a
+    deterministic order and git sees no phantom diffs.
     """
     if fast_ms is None:
         fast_ms = FAST_THRESHOLD_MS
@@ -281,12 +258,10 @@ def build_buckets(round_result: Dict[str, Any],
     tls_of = round_result["tls"]
     stable = round_result["stable"]
 
-    # کانفیگِ پایدارِ بی‌تأخیر نداریم، ولی اگر پیش آمد نباید خاموش گم شود.
-    ranked = sorted(stable, key=lambda L: (delays.get(L, 10 ** 9), L))
-
+    ranked = sorted(stable, key=lambda link: (delays.get(link, _NO_DELAY), link))
     verified = ranked
-    fast = [L for L in ranked if delays.get(L, 10 ** 9) < fast_ms]
-    secure = [L for L in ranked if is_secure(L, tls_of.get(L, ""))]
+    fast = [link for link in ranked if delays.get(link, _NO_DELAY) < fast_ms]
+    secure = [link for link in ranked if is_secure(link, tls_of.get(link, ""))]
     top = ranked[:top_n]
 
     return {
@@ -313,15 +288,18 @@ def build_buckets(round_result: Dict[str, Any],
     }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# نوشتنِ خروجی
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+# Writing output
+# --------------------------------------------------------------------------- #
 
 def _write_lines(path: str, header: str, lines: Sequence[str]) -> None:
-    # گاردِ خروجی: سرآیند و هر خط **جداگانه** بازبینی می‌شوند، نه با ساختنِ یک
-    # رشتهٔ غول؛ اینجا فایل‌ها ده‌هزار خطی‌اند و ادغامِ آن‌ها در حافظه هزینهٔ
-    # بی‌دلیل دارد. بازبینی پیش از باز کردنِ فایل انجام می‌شود تا فایلِ
-    # نیمه‌نوشته باقی نماند.
+    """Write a header plus one line per entry, vetting content first.
+
+    The header and each line are vetted separately rather than by joining them
+    into one giant string: these files run to tens of thousands of lines.
+    Vetting happens before the file is opened so a rejected write leaves no
+    half-written file behind.
+    """
     core.assert_no_control_bytes(path, header)
     for line in lines:
         core.assert_no_control_bytes(path, line)
@@ -334,129 +312,137 @@ def _write_lines(path: str, header: str, lines: Sequence[str]) -> None:
             fh.write(line + "\n")
 
 
-def write_buckets(out_dir: str, buckets: Dict[str, Any]) -> Dict[str, str]:
+def _category_headers(stats: Dict[str, Any]) -> Dict[str, str]:
+    """Per-category file headers.
+
+    Each header states the *measured* criterion, so a user can see what "secure"
+    or "fast" is actually claiming.
+
+    The Hiddify profile header goes first so it stays inside Hiddify's 29-line
+    scan window; the longest descriptive header below is 8 lines.
     """
-    سه سبد + `top100.txt` را می‌نویسد و مسیرها را برمی‌گرداند.
-
-    هر فایل سرآیندی دارد که **معیارِ سنجیده** را می‌گوید، نه شعار — تا کاربر
-    بداند «امن» یا «سریع» بر چه پایه‌ای ادعا شده.
-    """
-    st = buckets["stats"]
-    rounds = st["rounds"]
-    written: Dict[str, str] = {}
-
-    # سرآیندِ درون‌فایلیِ Hiddify — **پیش از** سرآیندِ توضیحیِ موجود می‌آید تا
-    # قطعاً داخلِ پنجرهٔ ۲۹ خطیِ پویشگرِ Hiddify بماند. طولانی‌ترین سرآیندِ
-    # توضیحیِ فعلی (secure) ۸ خط است ⇒ ۵+۸=۱۳ خط، با حاشیهٔ امن.
-    # اندازه‌گیری شد که کلیدهای استخراج‌شده از سرآیندهای فعلی
-    # (`criterion`/`note`/`measured`/…) با هیچ‌کدام از ۲۳ کلیدِ
-    # `overridable:"true"`ِ Hiddify تلاقی ندارند ⇒ کاملاً بی‌اثرند.
-    hh = {cat: core.hiddify_profile_header(cat.upper()) for cat in CATEGORIES}
-
-    heads = {
+    rounds = stats["rounds"]
+    profile = {cat: core.hiddify_profile_header(cat.upper()) for cat in CATEGORIES}
+    return {
         "verified": (
-            hh["verified"] +
-            f"# @Raydikalx — VERIFIED — {st['verified']} configs\n"
+            profile["verified"] +
+            f"# @Raydikalx - VERIFIED - {stats['verified']} configs\n"
             f"# criterion: a real proxied request to {realtest.TEST_URL} succeeded\n"
             f"# in ALL {rounds} independent runs of this round.\n"
-            f"# measured: {st['flaky_pct']}% of everything that ever worked is "
+            f"# measured: {stats['flaky_pct']}% of everything that ever worked is "
             f"flaky, so a single run is not enough.\n"),
         "fast": (
-            hh["fast"] +
-            f"# @Raydikalx — FAST — {st['fast']} configs\n"
+            profile["fast"] +
+            f"# @Raydikalx - FAST - {stats['fast']} configs\n"
             f"# criterion: verified AND median delay across {rounds} runs "
-            f"< {st['fast_threshold_ms']}ms.\n"
+            f"< {stats['fast_threshold_ms']}ms.\n"
             f"# the median (not one sample) is used because configs cross this "
             f"line between runs: measured 34.4% of them in a 5-run experiment.\n"
             f"# that share depends on the network the test ran on, so treat it "
             f"as the reason for using a median, not as a constant.\n"),
         "secure": (
-            hh["secure"] +
-            f"# @Raydikalx — SECURE — {st['secure']} configs\n"
-            f"# criterion: verified AND forward secrecy — the session key comes\n"
+            profile["secure"] +
+            f"# @Raydikalx - SECURE - {stats['secure']} configs\n"
+            f"# criterion: verified AND forward secrecy - the session key comes\n"
             f"# from an (EC)DHE handshake (TLS/REALITY, or QUIC which mandates\n"
-            f"# TLS 1.3 per RFC 9001 §4.2) AND the link does not disable\n"
+            f"# TLS 1.3 per RFC 9001 section 4.2) AND the link does not disable\n"
             f"# certificate validation.\n"
             f"# note: this repo is PUBLIC. A pre-shared-key protocol such as\n"
             f"# shadowsocks is decryptable by anyone who reads the link, so it\n"
             f"# is NOT listed here even though it is encrypted on the wire.\n"),
     }
 
-    for cat in CATEGORIES:
-        path = os.path.join(out_dir, cat, "configs.txt")
-        # سپرِ `#` — توضیحِ کامل در core.py، بخشِ «سپرِ `#`». عامدانه اینجا و نه
-        # داخلِ `_write_lines`: آن تابع پایین‌تر برای بدنهٔ yaml/json هم به کار
-        # می‌رود و آنجا مفهومِ «خطِ کانفیگ» وجود ندارد.
-        _write_lines(path, heads[cat], core.shield_unsupported_runs(buckets[cat]))
-        written[cat] = path
-        # ── چرا سه فایلِ دیگر هم لازم است ────────────────────────────────
-        # سنجیده شد، حدس نیست: `validate.py` هر دایرکتوریِ دسته را که
-        # **وجود داشته باشد** با همان سختیِ دسته‌های اصلی می‌سنجد و
-        # `singbox.json`/`clash.yaml`ِ نبوده را `missing` می‌شمارد. با تنها
-        # `configs.txt` نتیجه اندازه‌گیری شد: ok=False، missing=2 ⇒ دروازهٔ
-        # انتشار با `--strict` کدِ ۱ می‌داد و کلِ انتشار می‌شکست. پس یا باید
-        # هر چهار فایل نوشته شود، یا دسته اصلاً ساخته نشود.
-        # ⚠️ `singbox.json` عمداً سرآیندِ Hiddify نمی‌گیرد: JSONِ استاندارد با
-        #    کامنت می‌شکند (اندازه‌گیری شد: `json.loads` ⇒ JSONDecodeError) و
-        #    `validate.py::check_singbox` دقیقاً `json.load` می‌زند.
-        #    `head=hh[cat]` با default-argument بسته می‌شود. صادقانه: **امروز
-        #    لازم نیست** — این lambdaها در همین تکرارِ حلقه صدا زده می‌شوند، پس
-        #    late-binding نمی‌تواند بروز کند (با mutation test سنجیده شد: نسخهٔ
-        #    بدونِ default-argument هر ۳۳۵ آزمون را پاس می‌کند). نگه‌داشته
-        #    می‌شود چون اگر روزی این lambdaها جمع و بعداً اجرا شوند، بی‌صدا
-        #    سرآیندِ آخرین دسته به هر سه فایل می‌رود.
-        for name, build in (
-            ("configs_base64.txt",
-             lambda L, head=hh[cat]: core.encode_base64_subscription(L, header=head)),
-            ("clash.yaml",
-             lambda L, head=hh[cat]: head + converters.build_clash_yaml(L)),
-            ("singbox.json", lambda L: converters.build_singbox_json(L)),
-        ):
-            try:
-                body = build(buckets[cat])
-            except Exception as exc:  # noqa: BLE001
-                # تبدیل‌کننده‌ها ممکن است روی یک لینکِ خاص بشکنند؛ آن نباید
-                # کلِ آبشار را از بین ببرد، ولی **باید دیده شود**.
-                print(f"⚠️ {cat}/{name}: {exc}", file=sys.stderr)
-                continue
-            sub = os.path.join(out_dir, cat, name)
-            _write_lines(sub, "", [body.rstrip("\n")])
-            written[f"{cat}/{name}"] = sub
 
-    top_path = os.path.join(out_dir, "top100.txt")
-    short = st["top_short_by"]
+def _write_category(out_dir: str, cat: str, links: Sequence[str], header: str,
+                    profile_header: str) -> Dict[str, str]:
+    """Write all four files for one category and return the paths written.
+
+    All four are required, not optional: validate.py judges any category
+    directory that *exists* as strictly as a core one and counts a missing
+    singbox.json/clash.yaml as `missing`. Writing only configs.txt measured
+    ok=False, missing=2, so `--strict` closed the publish gate. Either write all
+    four or do not create the category.
+
+    singbox.json deliberately gets no profile header: comments break standard
+    JSON and validate.py calls json.load on it.
+    """
+    written: Dict[str, str] = {}
+    path = os.path.join(out_dir, cat, "configs.txt")
+    # The `#` shield applies to config lines only, which is why it is here and
+    # not inside _write_lines: that helper also writes yaml/json bodies.
+    _write_lines(path, header, core.shield_unsupported_runs(links))
+    written[cat] = path
+
+    builders = (
+        ("configs_base64.txt",
+         lambda items: core.encode_base64_subscription(items, header=profile_header)),
+        ("clash.yaml",
+         lambda items: profile_header + converters.build_clash_yaml(items)),
+        ("singbox.json", converters.build_singbox_json),
+    )
+    for name, build in builders:
+        try:
+            body = build(links)
+        except Exception as exc:  # noqa: BLE001
+            # A converter may break on one specific link. That must not destroy
+            # the cascade, but it must be visible.
+            print(f"WARN {cat}/{name}: {exc}", file=sys.stderr)
+            continue
+        sub = os.path.join(out_dir, cat, name)
+        _write_lines(sub, "", [body.rstrip("\n")])
+        written[f"{cat}/{name}"] = sub
+    return written
+
+
+def write_buckets(out_dir: str, buckets: Dict[str, Any]) -> Dict[str, str]:
+    """Write the three buckets plus top100.txt and return the paths."""
+    stats = buckets["stats"]
+    headers = _category_headers(stats)
+    written: Dict[str, str] = {}
+
+    for cat in CATEGORIES:
+        written.update(_write_category(
+            out_dir, cat, buckets[cat], headers[cat],
+            core.hiddify_profile_header(cat.upper()),
+        ))
+
+    top = buckets["top"]
+    short = stats["top_short_by"]
     top_head = (
-        core.hiddify_profile_header(f"TOP {len(buckets['top'])}") +
-        f"# @Raydikalx — TOP {len(buckets['top'])} — sorted by median delay\n"
-        f"# every entry passed a real proxied request in all {rounds} runs.\n")
+        core.hiddify_profile_header(f"TOP {len(top)}") +
+        f"# @Raydikalx - TOP {len(top)} - sorted by median delay\n"
+        f"# every entry passed a real proxied request in all "
+        f"{stats['rounds']} runs.\n")
     if short:
-        # اعلامِ صریح به‌جای پرکردنِ مصنوعی. کاربر باید بداند استخر کوچک بود.
-        top_head += (f"# NOTE: only {len(buckets['top'])} configs met the bar "
-                     f"this round ({short} short of {TOP_N}). The file is NOT "
-                     f"padded with untested configs.\n")
-    _write_lines(top_path, top_head, core.shield_unsupported_runs(buckets["top"]))
+        # Say so explicitly instead of padding. The user should know the pool
+        # was small.
+        top_head += (f"# NOTE: only {len(top)} configs met the bar this round "
+                     f"({short} short of {TOP_N}). The file is NOT padded with "
+                     f"untested configs.\n")
+    top_path = os.path.join(out_dir, "top100.txt")
+    _write_lines(top_path, top_head, core.shield_unsupported_runs(top))
     written["top"] = top_path
     return written
 
 
-#: از کجا کشورِ خروج پرسیده می‌شود. عمداً **همان میزبانی** است که خودِ آزمون
-#: به آن وصل می‌شود (`realtest.TEST_URL`)، پس نه دامنهٔ تازه‌ای اضافه می‌کند و
-#: نه وابستگیِ تازه‌ای. سنجیده شد: از سندباکس `loc=US colo=IAD` و از سرورِ
-#: آلمان `loc=DE colo=FRA` برمی‌گرداند.
+# --------------------------------------------------------------------------- #
+# Exit country
+# --------------------------------------------------------------------------- #
+
+#: Where the exit country is asked. Deliberately the same host the test itself
+#: connects to, so it adds no new domain and no new dependency.
 TRACE_URL = "https://cp.cloudflare.com/cdn-cgi/trace"
 
 
 def exit_country(timeout: float = 10.0) -> Optional[Dict[str, str]]:
-    """
-    کشورِ **خروجِ** ماشینی که آزمون را اجرا می‌کند.
+    """Exit country of the machine running the test.
 
-    چرا لازم است: برچسبِ `verified` یعنی «از دیدگاهِ همین ماشین کار کرد».
-    کاربرِ ایرانی که فهرست را از runnerِ آمریکایی می‌گیرد باید بداند این
-    سنجش از کجا انجام شده. بدونِ این فیلد، عددها بی‌قید و در نتیجه
-    گمراه‌کننده‌اند.
+    A `verified` label means "it worked from this machine", so a user in Iran
+    reading a list produced by a US runner needs to know where it was measured.
+    Without this field the numbers are unqualified and therefore misleading.
 
-    «بهترین تلاش» است: هر خطایی → `None`. یک گزارشِ ناقصِ سلامت هرگز نباید
-    انتشارِ کانفیگ‌ها را بشکند.
+    Best effort: any error returns None. An incomplete health report must never
+    break config publication.
     """
     import urllib.request
 
@@ -468,150 +454,168 @@ def exit_country(timeout: float = 10.0) -> Optional[Dict[str, str]]:
 
     out: Dict[str, str] = {}
     for row in body.splitlines():
-        k, _, v = row.partition("=")
-        if k in ("loc", "colo") and v:
-            out[k] = v
+        key, _, value = row.partition("=")
+        if key in ("loc", "colo") and value:
+            out[key] = value
     if not out:
         return None
     out["source"] = TRACE_URL
     return out
 
 
-def merge_health(out_dir: str, cascade: Dict[str, Any]) -> Optional[str]:
-    """
-    بلوکِ `cascade` را به `health.json`ِ موجود **می‌افزاید**.
+# --------------------------------------------------------------------------- #
+# Merging into published reports
+# --------------------------------------------------------------------------- #
 
-    چرا افزودن و نه ساختن: `aggregate.py` این فایل را می‌سازد و در ورک‌فلو
-    **پیش از** آبشار اجرا می‌شود (آبشار به `all/configs.txt`ِ همان اجرا
-    نیاز دارد). پس آمارِ لایه‌ها نمی‌تواند از `build_health_report` بیاید و
-    باید بعداً ادغام شود.
+def _load_json_doc(path: str, purpose: str) -> Optional[Dict[str, Any]]:
+    """Load an existing JSON object, warning and returning None on any problem.
 
-    اگر فایل نباشد یا خراب باشد، بی‌صدا رد نمی‌شود — هشدار می‌دهد ولی
-    استثنا پرتاب نمی‌کند، چون این فیلد **مانیتورینگ** است نه محصول.
+    Shared by the health and index merges. Both are monitoring/advertising, not
+    the product, so they warn and give up instead of raising.
     """
-    path = os.path.join(out_dir, "health.json")
     if not os.path.exists(path):
-        print(f"⚠️ {path} نیست؛ آمارِ لایه‌ها ادغام نشد", file=sys.stderr)
+        print(f"WARN {path} does not exist; {purpose} skipped", file=sys.stderr)
         return None
     try:
         with open(path, "r", encoding="utf-8") as fh:
             doc = json.load(fh)
     except Exception as exc:  # noqa: BLE001
-        print(f"⚠️ {path} خوانده نشد ({exc}); آمارِ لایه‌ها ادغام نشد",
+        print(f"WARN {path} is unreadable ({exc}); {purpose} skipped",
               file=sys.stderr)
         return None
     if not isinstance(doc, dict):
-        print(f"⚠️ {path} یک شیء JSON نیست؛ ادغام نشد", file=sys.stderr)
+        print(f"WARN {path} is not a JSON object; {purpose} skipped",
+              file=sys.stderr)
+        return None
+    return doc
+
+
+def _atomic_write_json(path: str, doc: Dict[str, Any],
+                       purpose: str) -> Optional[str]:
+    """Write JSON atomically, returning the path or None on failure.
+
+    tmp + os.replace, because a half-written health.json is worse than none.
+    Failures are reported rather than raised: these files are published after
+    the configs already are, so a write error here must not fail the cascade.
+    """
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        os.replace(tmp, path)
+        return path
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARN could not write {path} ({exc}); {purpose} skipped",
+              file=sys.stderr)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
         return None
 
+
+def merge_health(out_dir: str, cascade: Dict[str, Any]) -> Optional[str]:
+    """Add the ``cascade`` block to an existing ``health.json``.
+
+    Added rather than created because aggregate.py builds that file and runs
+    *before* the cascade in the workflow (the cascade needs the same run's
+    all/configs.txt), so layer stats cannot come from build_health_report.
+    """
+    path = os.path.join(out_dir, "health.json")
+    doc = _load_json_doc(path, "layer stats not merged")
+    if doc is None:
+        return None
     doc["cascade"] = cascade
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(doc, fh, ensure_ascii=False, indent=2)
-        fh.write("\n")
-    os.replace(tmp, path)  # اتمیک: یک health.jsonِ نیم‌نوشته بدتر از هیچ است
-    return path
+    return _atomic_write_json(path, doc, "layer stats not merged")
 
 
-#: معیارِ کوتاهِ هر دستهٔ آبشاری — همان چیزی که در سرآیندِ فایل هم آمده، ولی
-#: یک‌خطی و ماشین‌خوان. مصرف‌کنندهٔ index.json نباید مجبور شود فایلِ متنی را
-#: دانلود و سرآیندش را parse کند تا بفهمد «سریع» یعنی چه.
+#: One-line, machine-readable criterion per cascade category. An index.json
+#: consumer should not have to download a text file and parse its header to
+#: learn what "fast" means.
 CASCADE_CRITERIA = {
-    "verified": ("a real proxied request succeeded in ALL rounds "
-                 "of this run"),
+    "verified": "a real proxied request succeeded in ALL rounds of this run",
     "fast": "verified AND median delay across all rounds is under the threshold",
     "secure": ("verified AND forward secrecy ((EC)DHE via TLS/REALITY/QUIC) "
                "AND certificate validation not disabled"),
 }
 
+#: Filename -> index key. Deliberately the same keys aggregate.build_index uses,
+#: so consumers never see two shapes for the same thing.
+_INDEX_FILE_KEYS = (
+    ("configs.txt", "configs_txt"),
+    ("configs_base64.txt", "configs_base64"),
+    ("clash.yaml", "clash_yaml"),
+    ("singbox.json", "singbox_json"),
+)
 
-def merge_index(out_dir: str, buckets: Dict[str, Any]) -> Optional[str]:
-    """دسته‌های آبشاری و `top100` را به `index.json`ِ موجود **می‌افزاید**.
 
-    چرا افزودن و نه ساختن — دقیقاً به همان دلیلِ `merge_health`: `index.json`
-    را `aggregate.py` می‌سازد و در ورک‌فلو **پیش از** آبشار اجرا می‌شود، پس
-    وقتی `build_index` صدا زده می‌شود هنوز `verified/`، `fast/`، `secure/` و
-    `top100.txt` وجود ندارند. نتیجه‌اش این بود که index.json این چهار خروجی را
-    اصلاً تبلیغ نمی‌کرد.
+def _bases_of(doc: Dict[str, Any], path: str) -> Optional[Tuple[str, str]]:
+    """``(primary, mirror)`` URL roots read from the document itself.
 
-    ⚠️ کلیدِ `categories` **دست‌نخورده** می‌ماند و دسته‌های آبشاری زیرِ کلیدِ
-    جداگانهٔ `cascade_categories` می‌روند. این تزئین نیست، اجبار است:
-      • `docs/index.html` روی `Object.entries(categories)` حلقه می‌زند و از
-        هر بلوکِ `files` فهرستِ لینک می‌سازد؛
-      • گامِ آبشار در ورک‌فلو `continue-on-error: true` است، پس ممکن است یک
-        دور اصلاً اجرا نشود.
-      ⇒ اگر این‌ها را داخلِ `categories` می‌گذاشتیم، صفحهٔ داکس لینک‌هایی را
-        تبلیغ می‌کرد که می‌توانند ۴۰۴ بدهند. خلاصهٔ کارِ ورک‌فلو و تست‌ها هم
-        روی همان سه‌تاییِ ثابتِ (all, heavy, light) حلقه می‌زنند و شکل‌شان
-        نباید عوض شود.
-
-    ریشهٔ URLها از **خودِ همین سند** خوانده می‌شود (`primary_base` /
-    `mirror_base` که `aggregate.build_index` نوشته)، نه از ثابتی که اینجا
-    دوباره تعریف شود — پس واگرایی از ریشه ممکن نیست.
-
-    فقط فایل‌هایی تبلیغ می‌شوند که **واقعاً روی دیسک هستند** — همان قراردادی
-    که `test_index_only_advertises_urls_whose_files_exist` برای
-    `aggregate.build_index` برقرار کرده است. برای همین تابع، تستِ
-    `test_zzz_idx_never_advertises_a_file_that_does_not_exist` آن را قفل می‌کند.
-
-    مثلِ `merge_health`: اگر فایل نباشد یا خراب باشد هشدار می‌دهد و `None`
-    برمی‌گرداند — استثنا پرتاب نمی‌کند، چون این فیلد **تبلیغ** است نه محصول و
-    نباید کلِ آبشار را بشکند.
+    Read from the document rather than redefined here, so the roots cannot
+    diverge from what aggregate.build_index wrote. The mirror is optional.
     """
-    path = os.path.join(out_dir, "index.json")
-    if not os.path.exists(path):
-        print(f"⚠️ {path} نیست؛ دسته‌های آبشاری تبلیغ نشدند", file=sys.stderr)
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            doc = json.load(fh)
-    except Exception as exc:  # noqa: BLE001
-        print(f"⚠️ {path} خوانده نشد ({exc}); دسته‌های آبشاری تبلیغ نشدند",
-              file=sys.stderr)
-        return None
-    if not isinstance(doc, dict):
-        print(f"⚠️ {path} یک شیء JSON نیست؛ ادغام نشد", file=sys.stderr)
-        return None
-
     primary = doc.get("primary_base")
-    mirror = doc.get("mirror_base")
     if not isinstance(primary, str) or not primary:
-        print(f"⚠️ {path} کلیدِ primary_base ندارد؛ ادغام نشد", file=sys.stderr)
+        print(f"WARN {path} has no primary_base; not merged", file=sys.stderr)
         return None
-    if not isinstance(mirror, str) or not mirror:
-        # آینه اختیاری است؛ نبودش نباید کلِ ادغام را لغو کند.
-        mirror = ""
+    mirror = doc.get("mirror_base")
+    return primary, mirror if isinstance(mirror, str) else ""
 
-    def _rel(*parts: str) -> str:
-        return "/".join(parts)
 
-    #: نگاشتِ نامِ فایل روی کلیدِ index — عمداً **همان کلیدهای**
-    #: `aggregate.build_index.cat_block` تا مصرف‌کننده دو شکلِ متفاوت نبیند.
-    file_keys = (
-        ("configs.txt", "configs_txt"),
-        ("configs_base64.txt", "configs_base64"),
-        ("clash.yaml", "clash_yaml"),
-        ("singbox.json", "singbox_json"),
-    )
-
+def _cascade_index_block(out_dir: str, buckets: Dict[str, Any],
+                         primary: str, mirror: str) -> Dict[str, Any]:
+    """Index entries for the cascade categories that exist on disk."""
     cascade: Dict[str, Any] = {}
     for cat in CATEGORIES:
         cat_dir = os.path.join(out_dir, cat)
         files: Dict[str, str] = {}
-        for fname, key in file_keys:
+        for fname, key in _INDEX_FILE_KEYS:
             if not os.path.exists(os.path.join(cat_dir, fname)):
                 continue
-            files[key] = f"{primary}/{_rel(cat, fname)}"
+            files[key] = f"{primary}/{cat}/{fname}"
             if mirror:
-                files[f"{key}_mirror"] = f"{mirror}/{_rel(cat, fname)}"
+                files[f"{key}_mirror"] = f"{mirror}/{cat}/{fname}"
         if not files:
-            # دسته اصلاً نوشته نشد (مثلاً استخر تهی بود) ⇒ تبلیغش نکن.
+            # The category was never written, e.g. the pool was empty. Do not
+            # advertise it.
             continue
         cascade[cat] = {
             "unique": len(buckets.get(cat, [])),
             "criterion": CASCADE_CRITERIA.get(cat, ""),
             "files": files,
         }
+    return cascade
+
+
+def merge_index(out_dir: str, buckets: Dict[str, Any]) -> Optional[str]:
+    """Add the cascade categories and ``top100`` to an existing ``index.json``.
+
+    Added rather than created for the same reason as :func:`merge_health`: when
+    aggregate.build_index runs, verified/, fast/, secure/ and top100.txt do not
+    exist yet, so index.json never advertised them at all.
+
+    The ``categories`` key is left untouched and cascade categories go under a
+    separate ``cascade_categories`` key. That is required, not cosmetic:
+    docs/index.html loops over Object.entries(categories) to build its links,
+    and the cascade workflow step is `continue-on-error: true`, so a round may
+    not run. Folding them into ``categories`` would advertise links that can 404.
+
+    Only files that really exist on disk are advertised, matching the contract
+    aggregate.build_index already honours.
+    """
+    path = os.path.join(out_dir, "index.json")
+    purpose = "cascade categories not advertised"
+    doc = _load_json_doc(path, purpose)
+    if doc is None:
+        return None
+    bases = _bases_of(doc, path)
+    if bases is None:
+        return None
+    primary, mirror = bases
+
+    cascade = _cascade_index_block(out_dir, buckets, primary, mirror)
     if cascade:
         doc["cascade_categories"] = cascade
 
@@ -627,154 +631,156 @@ def merge_index(out_dir: str, buckets: Dict[str, Any]) -> Optional[str]:
             top_block["url_mirror"] = f"{mirror}/{top_name}"
         doc["top100"] = top_block
 
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(doc, fh, ensure_ascii=False, indent=2)
-        fh.write("\n")
-    os.replace(tmp, path)  # اتمیک: index.jsonِ نیم‌نوشته بدتر از هیچ است
-    return path
+    return _atomic_write_json(path, doc, purpose)
 
+
+# --------------------------------------------------------------------------- #
+# Full run
+# --------------------------------------------------------------------------- #
 
 def _pct(part: int, whole: int) -> float:
-    """درصدِ `part` از `whole`؛ تقسیم بر صفر → صفر، نه استثنا.
-
-    یک اجرای با ورودیِ تهی نباید گزارشِ سلامت را بشکند.
-    """
+    """``part`` as a percentage of ``whole``; division by zero gives 0.0."""
     if not whole:
         return 0.0
     return round(100.0 * part / whole, 2)
 
 
-def run_pipeline(lines: Iterable[str], out_dir: str,
-                 rounds: Optional[int] = None, fast_ms: Optional[int] = None,
-                 top_n: Optional[int] = None, **kwargs: Any) -> Dict[str, Any]:
-    """آبشارِ کامل: L0/L1 → L2 → L3×n → سبدها → فایل‌ها → health.json."""
-    lines = list(lines)
-    t_all = time.time()
+def _cascade_report(pre: Dict[str, Any], l2: Dict[str, Any],
+                    stats: Dict[str, Any], open_count: int,
+                    timings: Dict[str, float]) -> Dict[str, Any]:
+    """The ``cascade`` block published into health.json.
 
-    # ── چرا L0/L1 دوباره صدا زده می‌شود ────────────────────────────────────
-    # `check_lines` خودش `filters.filter_lines` را می‌زند ولی تنها *خلاصهٔ*
-    # آن (`filter`) را بیرون می‌دهد؛ تفکیکِ **دلیلِ حذف** در کلیدِ `dropped`
-    # می‌ماند و به بیرون نمی‌رسد. B13 همان تفکیک را می‌خواهد. دو راهِ دیگر
-    # بدتر بودند: دست‌بردن در `filters.py`/`reachability.py` که هر دو
-    # جهش‌آزمایی و commit شده‌اند، یا بازنویسیِ منطقِ لایه در همین فایل که
-    # هدفِ «چیدن، نه تکرار کردن» را نقض می‌کرد. هزینه سنجیده شد:
-    # L0/L1 روی ۸۱۵۸ کانفیگ ۰٫۳۵ ثانیه است ⇒ ۰٫۲٪ از ۱۴۹ ثانیهٔ آبشار.
-    t = time.time()
-    pre = filters.filter_lines(lines)
-    l01_s = round(time.time() - t, 2)
-
-    t = time.time()
-    l2 = reachability.check_lines(lines)
-    l2_s = round(time.time() - t, 2)
-    open_lines = l2["kept_open"]
-
-    t = time.time()
-    rr = run_l3_round(open_lines, rounds=rounds, **kwargs)
-    l3_s = round(time.time() - t, 2)
-
-    buckets = build_buckets(rr, fast_ms=fast_ms, top_n=top_n)
-    paths = write_buckets(out_dir, buckets)
-    st = buckets["stats"]
-    st["l2"] = l2["stats"]
-    buckets["paths"] = paths
-
-    total_s = round(time.time() - t_all, 2)
-    cascade = {
+    l2's `in` comes from `pre`, not from l2's own `configs_in`:
+    reachability.check_lines takes *raw* lines and re-runs L0/L1 itself, so
+    configs_in is the raw input (measured 300 where L0/L1 kept 295). Reporting
+    300 after a layer that emitted 295 reads as if 5 configs appeared from
+    nowhere. reachability's own number is kept under the explicit name
+    `open_pct_of_raw_input`; they answer two different questions.
+    """
+    l2_stats = l2["stats"]
+    kept = pre["stats"]["kept"]
+    return {
         "exit_country": exit_country(),
         "layers": {
             "l0_l1": {
                 "in": pre["stats"]["input"],
-                "out": pre["stats"]["kept"],
+                "out": kept,
                 "dropped": pre["dropped"],
                 "endpoints_unique": pre["stats"]["endpoints_unique"],
                 "dedup_saving_pct": pre["stats"]["dedup_saving_pct"],
-                "seconds": l01_s,
+                "seconds": timings["l0_l1"],
             },
-            # چرا `in` اینجا از `pre` می‌آید و نه از `configs_in`:
-            # `reachability.check_lines` سطرهای **خام** را می‌گیرد و خودش
-            # L0/L1 را از نو می‌زند، پس `configs_in` همان ورودیِ خام است
-            # (سنجیده شد: ۳۰۰ در حالی که L0/L1 تنها ۲۹۵ را نگه داشته بود).
-            # گزارش‌کردنِ ۳۰۰ در زنجیره‌ای که لایهٔ قبل ۲۹۵ بیرون داده،
-            # خواننده را به این نتیجه می‌رساند که ۵ کانفیگ از هیچ‌جا پیدا
-            # شده. چیزی که L2 واقعاً می‌سنجد `pre["kept"]` است، پس زنجیره
-            # باید ۳۰۰ → ۲۹۵ → ۶۹ خوانده شود.
-            # عددِ خودِ `reachability` حذف نمی‌شود — با نامِ صریحِ
-            # `open_pct_of_raw_input` می‌ماند تا کسی گمان نکند یک عددِ
-            # سنجیده‌شده را دستکاری کرده‌ام؛ فقط دو پرسشِ متفاوت‌اند.
             "l2": {
-                "in": pre["stats"]["kept"],
-                "out": l2["stats"]["configs_open"],
-                "open_pct": _pct(l2["stats"]["configs_open"],
-                                 pre["stats"]["kept"]),
-                "open_pct_of_raw_input": l2["stats"]["configs_open_pct"],
-                "dns_failed": l2["stats"]["dns_failed"],
-                "dns_seconds": l2["stats"]["dns_s"],
-                "tcp_seconds": l2["stats"]["tcp_s"],
-                "fd_before": l2["stats"]["fd_before"],
-                "fd_after": l2["stats"]["fd_after"],
-                "seconds": l2_s,
+                "in": kept,
+                "out": l2_stats["configs_open"],
+                "open_pct": _pct(l2_stats["configs_open"], kept),
+                "open_pct_of_raw_input": l2_stats["configs_open_pct"],
+                "dns_failed": l2_stats["dns_failed"],
+                "dns_seconds": l2_stats["dns_s"],
+                "tcp_seconds": l2_stats["tcp_s"],
+                "fd_before": l2_stats["fd_before"],
+                "fd_after": l2_stats["fd_after"],
+                "seconds": timings["l2"],
             },
             "l3": {
-                "in": len(open_lines),
-                "rounds": st["rounds"],
-                "per_run_ok": st["per_run_ok"],
-                "ever_ok": st["ever_ok"],
-                "stable": st["stable"],
-                "flaky_pct": st["flaky_pct"],
-                "seconds": l3_s,
+                "in": open_count,
+                "rounds": stats["rounds"],
+                "per_run_ok": stats["per_run_ok"],
+                "ever_ok": stats["ever_ok"],
+                "stable": stats["stable"],
+                "flaky_pct": stats["flaky_pct"],
+                "seconds": timings["l3"],
             },
         },
         "buckets": {
-            "verified": st["verified"],
-            "fast": st["fast"],
-            "secure": st["secure"],
-            "top": st["top"],
-            "top_short_by": st["top_short_by"],
-            "fast_threshold_ms": st["fast_threshold_ms"],
+            "verified": stats["verified"],
+            "fast": stats["fast"],
+            "secure": stats["secure"],
+            "top": stats["top"],
+            "top_short_by": stats["top_short_by"],
+            "fast_threshold_ms": stats["fast_threshold_ms"],
         },
-        "total_seconds": total_s,
+        "total_seconds": timings["total"],
     }
-    st["cascade"] = cascade
+
+
+def run_pipeline(lines: Iterable[str], out_dir: str,
+                 rounds: Optional[int] = None, fast_ms: Optional[int] = None,
+                 top_n: Optional[int] = None, **kwargs: Any) -> Dict[str, Any]:
+    """Full cascade: L0/L1 -> L2 -> L3 x n -> buckets -> files -> health.json."""
+    lines = list(lines)
+    started = time.time()
+
+    # L0/L1 is run here as well as inside check_lines because check_lines only
+    # surfaces the *summary*; the per-reason `dropped` breakdown stays inside.
+    # The alternatives were worse: editing two mutation-tested modules, or
+    # restating layer logic here and breaking "arrange, do not repeat". Cost
+    # measured at 0.35s over 8,158 configs, i.e. 0.2% of a 149s cascade.
+    mark = time.time()
+    pre = filters.filter_lines(lines)
+    l01_s = round(time.time() - mark, 2)
+
+    mark = time.time()
+    l2 = reachability.check_lines(lines)
+    l2_s = round(time.time() - mark, 2)
+    open_lines = l2["kept_open"]
+
+    mark = time.time()
+    round_result = run_l3_round(open_lines, rounds=rounds, **kwargs)
+    l3_s = round(time.time() - mark, 2)
+
+    buckets = build_buckets(round_result, fast_ms=fast_ms, top_n=top_n)
+    paths = write_buckets(out_dir, buckets)
+    stats = buckets["stats"]
+    stats["l2"] = l2["stats"]
+    buckets["paths"] = paths
+
+    cascade = _cascade_report(pre, l2, stats, len(open_lines), {
+        "l0_l1": l01_s,
+        "l2": l2_s,
+        "l3": l3_s,
+        "total": round(time.time() - started, 2),
+    })
+    stats["cascade"] = cascade
+
     health = merge_health(out_dir, cascade)
     if health:
-        buckets["paths"]["health.json"] = health
-    # همان الگو برای index.json: تا اینجا `write_buckets` اجرا شده، پس
-    # فایل‌های آبشاری روی دیسک‌اند و `merge_index` می‌تواند وجودشان را
-    # راستی‌آزمایی کند و فقط همان‌ها را تبلیغ کند.
+        paths["health.json"] = health
+    # Same pattern for index.json. write_buckets has already run, so the cascade
+    # files are on disk and merge_index can verify them before advertising.
     index = merge_index(out_dir, buckets)
     if index:
-        buckets["paths"]["index.json"] = index
+        paths["index.json"] = index
     return buckets
 
 
 def _main(argv: Sequence[str]) -> int:
-    ap = argparse.ArgumentParser(description="four-layer verification cascade")
-    ap.add_argument("input", help="file with one config per line")
-    ap.add_argument("--out", default=".", help="output directory")
-    ap.add_argument("--rounds", type=int, default=None)
-    ap.add_argument("--fast-ms", type=int, default=None)
-    ap.add_argument("--top-n", type=int, default=None)
-    ap.add_argument("--json", default=None, help="write stats as JSON here")
-    args = ap.parse_args(argv)
+    parser = argparse.ArgumentParser(description="four-layer verification cascade")
+    parser.add_argument("input", help="file with one config per line")
+    parser.add_argument("--out", default=".", help="output directory")
+    parser.add_argument("--rounds", type=int, default=None)
+    parser.add_argument("--fast-ms", type=int, default=None)
+    parser.add_argument("--top-n", type=int, default=None)
+    parser.add_argument("--json", default=None, help="write stats as JSON here")
+    args = parser.parse_args(argv)
 
     with open(args.input, "r", encoding="utf-8", errors="replace") as fh:
         lines = fh.read().splitlines()
 
-    res = run_pipeline(lines, args.out, rounds=args.rounds,
-                       fast_ms=args.fast_ms, top_n=args.top_n)
-    st = res["stats"]
-    print(f"→ rounds={st['rounds']} per_run_ok={st['per_run_ok']} "
-          f"ever_ok={st['ever_ok']} stable={st['stable']} "
-          f"flaky={st['flaky_pct']}%")
-    print(f"→ verified={st['verified']} fast={st['fast']} "
-          f"secure={st['secure']} top={st['top']}")
-    if st["top_short_by"]:
-        print(f"⚠️ top file is {st['top_short_by']} short of {TOP_N} — "
+    result = run_pipeline(lines, args.out, rounds=args.rounds,
+                          fast_ms=args.fast_ms, top_n=args.top_n)
+    stats = result["stats"]
+    print(f"-> rounds={stats['rounds']} per_run_ok={stats['per_run_ok']} "
+          f"ever_ok={stats['ever_ok']} stable={stats['stable']} "
+          f"flaky={stats['flaky_pct']}%")
+    print(f"-> verified={stats['verified']} fast={stats['fast']} "
+          f"secure={stats['secure']} top={stats['top']}")
+    if stats["top_short_by"]:
+        print(f"WARN top file is {stats['top_short_by']} short of {TOP_N} - "
               f"published unpadded")
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
-            json.dump(st, fh, ensure_ascii=False, indent=2)
+            json.dump(stats, fh, ensure_ascii=False, indent=2)
     return 0
 
 
