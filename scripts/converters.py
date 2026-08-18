@@ -1,29 +1,26 @@
 # -*- coding: utf-8 -*-
-"""
-converters.py — تبدیل کانفیگ‌های V2Ray به فرمت‌های Clash (Mihomo) YAML و Sing-box JSON.
+"""Convert V2Ray-style config URIs into Clash (Mihomo) YAML and sing-box JSON.
 
-پشتیبانی: vless, vmess, trojan, shadowsocks (ss), hysteria2, tuic.
+Supported: vless, vmess, trojan, shadowsocks, hysteria2, tuic.
 
-hysteria2 و tuic چرا اضافه شدند: توضیحاتِ مخزن این دو پروتکل را تبلیغ می‌کرد
-ولی هیچ‌کدام از دو مبدل آن‌ها را تولید نمی‌کرد. اندازه‌گیریِ زندهٔ خروجی نشان داد
-۸۰ کانفیگِ hysteria2 و ۱ کانفیگِ tuic در فایل‌های متنی منتشر می‌شوند اما در
-clash.yaml و singbox.json **صفر** حضور دارند. کاربری که فقط اشتراکِ Clash را
-وارد می‌کند، این‌ها را هرگز نمی‌بیند. فاصلهٔ میانِ آنچه تبلیغ می‌شود و آنچه
-تحویل داده می‌شود، خودش یک نقصِ اعتماد است.
+hysteria2 and tuic were added because the repo README advertised them while
+neither converter emitted them: 80 hysteria2 and 1 tuic config were published in
+the text files and appeared zero times in clash.yaml and singbox.json. A gap
+between what is advertised and what is delivered is itself a trust defect.
 
-wireguard آگاهانه بیرون ماند: بر خلافِ بقیه، wireguard کلیدِ خصوصیِ سمتِ کلاینت
-و نشانیِ داخلیِ تخصیص‌یافته لازم دارد. این‌ها در URI عمومی وجود ندارند، پس هر
-تبدیلی ناچار است مقدارِ جعلی بگذارد و کانفیگی بسازد که هرگز وصل نمی‌شود.
-شمارشِ زنده: صفر کانفیگِ wireguard در ورودی هست، پس تبدیلش هم سودی ندارد.
+wireguard is deliberately excluded: unlike the rest it needs a client private key
+and an assigned internal address, neither of which exists in a public URI, so any
+conversion would have to invent values and produce a config that never connects.
+Live count is zero wireguard configs anyway.
 
-قاعدهٔ طلایی این ماژول: **هرگز خروجی نامعتبر تولید نکن.**
-یک کانفیگ نامعتبر در وسط فایل، کل فایل را برای کلاینت غیرقابل‌استفاده می‌کند
-(چون sing-box و mihomo هنگام بارگذاری، کل سند را رد می‌کنند). پس هر مقداری
-که کلاینت نمی‌پذیرد یا drop می‌شود یا اصلاح می‌شود — نه اینکه خام عبور کند.
+Golden rule: never emit invalid output. One invalid entry makes the *whole* file
+unusable, because sing-box and mihomo reject the entire document on load. So any
+value a client will not accept is either repaired or dropped, never passed
+through raw. A config that loads cleanly and then never connects counts as
+invalid too.
 
-اعتبار همهٔ whitelist‌های زیر با اجرای واقعی روی این نسخه‌ها تأیید شده است:
-  • sing-box 1.13.14
-  • mihomo (Clash.Meta) v1.19.29
+Every whitelist below was verified by running the real clients:
+sing-box 1.13.14 and mihomo (Clash.Meta) v1.19.29.
 """
 from __future__ import annotations
 
@@ -32,164 +29,131 @@ import ipaddress
 import json
 import re
 import urllib.parse
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import core
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 🔒 برند — تنها یک منبعِ حقیقت
-# ══════════════════════════════════════════════════════════════════════════════
-# پیش از این، رشتهٔ «@Raydikalx» در ۶ نقطه از همین فایل به‌صورتِ literal تکرار
-# شده بود، در حالی که کامنتِ `core.BRAND_CHANNEL` می‌گفت «تنها جای تعریف». این
-# دوگانگی یک باگِ خفته بود: با تغییرِ برند در `core`، خروجیِ clash/sing-box
-# برندِ کهنه را نگه می‌داشت. الان همه از `core.BRAND_CHANNEL` مشتق می‌شوند.
+# --------------------------------------------------------------------------- #
+# Brand: one source of truth
 #
-# سیاستِ برندینگ (تصمیمِ مالک) در `core.py` بالای `BRAND_CHANNEL` مستند است:
-# هر نودی که منتشر می‌شود باید برند داشته باشد. این فایل هم تابعِ همان سیاست است.
+# "@Raydikalx" used to be a literal in six places here while core.BRAND_CHANNEL
+# claimed to be the only definition. That was a dormant bug: changing the brand in
+# core would have left clash/sing-box output on the old one.
+# --------------------------------------------------------------------------- #
 BRAND = core.BRAND_CHANNEL
 
-#: نامِ گروه‌های خروجی. **همه برنددار** — چون در UIِ کلاینت، گروه نخستین چیزی
-#: است که کاربر می‌بیند (پیش از فهرستِ نودها). یک‌جا تعریف می‌شوند تا تغییرِ نام
-#: هرگز یک مرجعِ ناهمخوان جا نگذارد؛ نامِ گروه در چند نقطه ارجاع می‌شود
-#: (`proxies` گروهِ select، `rules`/`final`، `default`، `detour` در DNS).
-GROUP_MAIN: str = f"🚀 {BRAND}"
-GROUP_AUTO: str = f"♻️ Auto | {BRAND}"
-GROUP_FALLBACK: str = f"🔯 Fallback | {BRAND}"
+#: Output group names, all branded, because the group is the first thing a user
+#: sees in a client UI. Defined once: the names are referenced from the selector's
+#: proxy list, the rules/final, the default, and the DNS detour.
+GROUP_MAIN: str = f"\N{ROCKET} {BRAND}"
+GROUP_AUTO: str = f"\N{BLACK UNIVERSAL RECYCLING SYMBOL} Auto | {BRAND}"
+GROUP_FALLBACK: str = f"\N{DINGBAT NEGATIVE CIRCLED SANS-SERIF DIGIT NINE} Fallback | {BRAND}"
 
 
 def _branded_fallback(kind: Optional[str]) -> str:
-    """
-    نامِ پیش‌فرضِ **برنددار** برای نودی که ریمارکِ بالادست ندارد.
+    """Branded default name for a node with no upstream remark.
 
-    چرا وجود دارد: چند نقطه در این فایل fallbackِ «بی‌برند» داشتند
-    (`… or "vmess"`، `… or scheme`، `… or cp["type"]`، `… or ob["type"]`).
-    اندازه‌گیری روی ۸٬۱۳۶ کانفیگِ واقعی نشان داد امروز **هیچ‌کدام شلیک نمی‌کنند**
-    (چون `aggregate.py` پیش از مبدل‌ها همه را برند می‌زند) — ولی این‌ها
-    *موضعِ دفاعی* هستند و موضعِ دفاعی باید به سمتِ درست نشانه رود. اگر روزی
-    داده‌ای از مسیرِ دیگری به مبدل برسد، پیش‌فرض باید **برنددار** باشد نه خالی.
+    Several fallbacks here used to be unbranded (`... or "vmess"`, `... or scheme`).
+    None of them fire today, because aggregate.py brands everything before the
+    converters run, but a defensive default should point the right way: if data
+    ever reaches the converter by another route, the default must carry the brand.
 
-    قطعی است: فقط تابعِ `kind` است، نه موقعیت یا زمان.
+    Deterministic: a function of `kind` only.
     """
-    k = (kind or "").strip() or "node"
-    return f"{k} | {BRAND}"
+    label = (kind or "").strip() or "node"
+    return f"{label} | {BRAND}"
 
 
 def _enforce_brand(name: Optional[str], kind: Optional[str]) -> str:
+    """Invariant gate on the final output name or tag.
+
+    Repo policy binds the invariant at three levels: remark, name, tag. The line
+    level was already covered by the branding gate in aggregate.py, but name/tag
+    had none, and that gap let one unbranded node reach clash.yaml and
+    singbox.json.
+
+    Behaviour is deliberately minimal so the change delta is exactly one name:
+      - already branded -> returned byte for byte, no strip, no normalising.
+      - empty -> _branded_fallback(kind), i.e. exactly the old
+        `cp["name"] or _branded_fallback(...)` behaviour.
+      - non-empty but unbranded -> _branded_fallback(kind). This is the only delta.
+
+    Replace rather than append: appending produced
+    "...(@SomeoneElse) | @Raydikalx", which still advertises a rival channel, and
+    this project treats that as the defect, not merely a missing brand.
+
+    Never drops a node: the owner explicitly rejected the strict option.
+    Idempotent, since the output always contains BRAND and the first branch
+    returns it untouched.
     """
-    دروازهٔ ناوردا روی **نامِ نهاییِ خروجی** (فاز C12، لایهٔ ۲).
-
-    سیاستِ مالک در `core.py` (خطوطِ ۳۲–۶۲) ناوردا را روی سه سطح می‌بندد:
-    «ریمارک/**نام**/**تگ**». سطحِ خط پیش‌تر با دروازهٔ E-6 در `aggregate.py`
-    تضمین شده بود، ولی سطحِ **نام/تگ** هیچ دروازه‌ای نداشت — و همین شکافْ نقصِ
-    C12 را تا `clash.yaml` و `singbox.json` رساند (۱ نودِ بی‌برند در هر دو).
-    این تابع آخرین حلقه است: چیزی که از این‌جا رد شود، منتشر می‌شود.
-
-    قراردادِ رفتاری — عمداً کمینه، تا دلتای تغییر **دقیقاً** یک نام باشد:
-
-      • نامِ برنددار  → **بایت‌به‌بایت** همان. هیچ `strip()`، هیچ نرمال‌سازی.
-        (اگر `strip` می‌زدیم، نام‌هایی که امروز فاصلهٔ انتهایی دارند هم عوض
-        می‌شدند و سنجشِ پایه — «۱ نام» — بی‌اعتبار می‌شد.)
-      • نامِ تهی      → `_branded_fallback(kind)`؛ یعنی **عیناً** رفتارِ قدیمِ
-        `cp["name"] or _branded_fallback(cp["type"])`. سازگاریِ عقب‌رو کامل.
-      • نامِ ناتهیِ **بی‌برند** → `_branded_fallback(kind)`. این تنها دلتاست.
-
-    چرا جایگزینی و نه الحاقِ برند: الحاق «🇮🇳TM (@AZARBAYJAB1) | @Raydikalx»
-    می‌ساخت که هنوز کانالِ رقیب را تبلیغ می‌کند — و کامنتِ `core.brand_remark`
-    نشان می‌دهد پروژه همین را نقص می‌داند، نه فقط نبودِ برند را.
-
-    چرا **حذف** نمی‌کنیم: مالک صریحاً گزینهٔ سخت‌گیرانه را رد کرد («احتمالِ حذفِ
-    داده»). این دروازه بازبرند می‌زند و هیچ نودی را نمی‌اندازد.
-
-    خودتوان است: `_enforce_brand(_enforce_brand(x, k), k) == _enforce_brand(x, k)`
-    چون خروجی همیشه `BRAND` را دارد و شاخهٔ نخست آن را دست‌نخورده برمی‌گرداند.
-    قطعی است: فقط تابعِ `(name, kind)`.
-    """
-    nm = name or ""
-    if BRAND in nm:
-        return nm
+    value = name or ""
+    if BRAND in value:
+        return value
     return _branded_fallback(kind)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# whitelist‌های اعتبارسنجی (همه با تست واقعی کلاینت استخراج شده‌اند)
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+# Validation whitelists, all extracted by running the real clients
+# --------------------------------------------------------------------------- #
 
-#: رمزهای shadowsocks که **هم** sing-box 1.13 و **هم** mihomo 1.19 می‌پذیرند.
-#: هر مقدار خارج از این مجموعه باعث خطای «unknown method» و رد شدن کل فایل می‌شود.
-#: (نمونهٔ واقعی خرابی: UUID که به‌جای cipher در URI آمده بود.)
+#: Shadowsocks methods accepted by *both* sing-box 1.13 and mihomo 1.19. Anything
+#: outside this set raises "unknown method" and the whole file is rejected. Real
+#: failure seen in the wild: a UUID sitting where the cipher belongs.
 SS_CIPHERS: frozenset = frozenset({
-    # AEAD مدرن
+    # Modern AEAD
     "aes-128-gcm", "aes-192-gcm", "aes-256-gcm",
     "chacha20-ietf-poly1305", "xchacha20-ietf-poly1305",
-    # Shadowsocks 2022 (کلید باید base64 با طول دقیق باشد → جدا اعتبارسنجی می‌شود)
+    # Shadowsocks 2022 (key must be base64 of an exact length, checked separately)
     "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
     "2022-blake3-chacha20-poly1305",
-    # جریانی قدیمی (ناامن ولی پذیرفته‌شده در هر دو کلاینت)
+    # Legacy stream ciphers: insecure, but accepted by both clients
     "aes-128-cfb", "aes-192-cfb", "aes-256-cfb",
     "aes-128-ctr", "aes-192-ctr", "aes-256-ctr",
     "rc4-md5", "chacha20-ietf", "none",
 })
 
-#: طول کلید لازم (بایت) برای هر روش Shadowsocks-2022.
-#: sing-box با پیام «bad key length» کل فایل را رد می‌کند اگر طول غلط باشد.
+#: Required key length in bytes per Shadowsocks-2022 method. A wrong length makes
+#: sing-box reject the whole file with "bad key length".
 SS2022_KEY_BYTES: Dict[str, int] = {
     "2022-blake3-aes-128-gcm": 16,
     "2022-blake3-aes-256-gcm": 32,
     "2022-blake3-chacha20-poly1305": 32,
 }
 
-# ── ShadowsocksR ──────────────────────────────────────────────────────────────
-#: 🔄 بازنگریِ سیاست — ۲۰۲۶-۰۸-۰۲ (جایگزینِ سیاستِ فازِ C11، بندِ ۲.۳)
-#:
-#: سیاستِ پیشین: «ssr فقط به clash.yaml می‌رود، چون sing-box آن را در ۱.۶.۰
-#: حذف کرده». نیمهٔ اولِ آن جمله دربارهٔ sing-box هنوز درست است، ولی نتیجه‌گیری
-#: غلط بود، و این با **اجرای هستهٔ رسمیِ Hiddify v4.1.0** روی خروجیِ زندهٔ خودِ
-#: همین مخزن ثابت شد، نه با استدلال:
-#:
-#:   • Hiddify فایلِ Clash را با `xmdhs/clash2singbox` تبدیل می‌کند و در
-#:     `convert/convert.go` سطرِ `"ssr": "shadowsocksr"` در `typeMap`
-#:     **کامنت** است. نوعِ پشتیبانی‌نشده `continue` می‌شود، ولی هم‌زمان
-#:     `jerr = errors.Join(jerr, fmt.Errorf("comm: %w %v", ErrNotSupportType, …))`
-#:     خطا را انباشته می‌کند و تابع آن را در انتها برمی‌گرداند.
-#:   • `hiddify-core/v2/config/parser.go:101-104` هر خطای این تبدیل را
-#:     **کشنده** می‌گیرد: `if err != nil { return nil, … }`.
-#:   ⇒ یک نودِ ssr کلِ clash.yaml را می‌سوزاند. اندازه‌گیریِ زنده روی خروجیِ
-#:     منتشرشده: all/heavy/light هر سه `exit 1` با پیامِ
-#:     «[ClashParser] converting clash to sing-box error: comm: 不支持的类型 ssr»
-#:     و fast/secure/verified (که ssr ندارند) `exit 0`. پس همبستگی کامل بود.
-#:   ⇒ پس از حذفِ ssr، هر سه فایل `exit 0` شدند با ۱۰٬۶۵۹ / ۹٬۰۰۹ / ۲٬۵۲۳
-#:     برون‌مسیر — یعنی ۲۸ نودِ ssr داشتند ۲۲٬۱۹۱ نودِ سالم را گروگان می‌گرفتند.
-#:
-#: چرا این یک «معاوضه» نیست، بلکه **اکیداً بهتر** است؟ چون کاربرِ mihomo چیزی
-#: از دست نمی‌دهد: mihomo خودش لینکِ `ssr://` را می‌فهمد
-#: (`common/convert/converter.go`, `case "ssr":`) و همان نودها در
-#: `configs.txt`، `configs_base64.txt` و `protocols/shadowsocksr.txt` دست‌نخورده
-#: منتشر می‌شوند. تنها چیزی که تغییر می‌کند، حضورِ ssr در فایلِ **clash.yaml**
-#: است — همان فایلی که به‌خاطرش برای Hiddify کاملاً بی‌مصرف می‌شد.
-#:
-#: مجموعه‌های `SSR_CIPHERS`/`SSR_OBFS`/`SSR_PROTOCOLS` عمداً **نگه داشته
-#: شده‌اند**: `_sanitize_ssr` هنوز برای اعتبارسنجیِ لینکِ ssr در مسیرِ متنی به
-#: کار می‌رود و حذفشان یک اعتبارسنجیِ واقعی را از بین می‌برد.
-#:
-#: (متنِ تاریخی، برای ثبت: sing-box از ۱.۶.۰ یک stub ثبت می‌کند که خطای
-#: «ShadowsocksR is deprecated and removed in sing-box 1.6.0» می‌دهد و **کل**
-#: سند را رد می‌کند — به همین دلیل `_to_singbox_outbound` هم `None` می‌دهد.)
-#:
-#: هر سه مجموعهٔ زیر کلمه‌به‌کلمه از سورسِ mihomo v1.19.29 استخراج شده‌اند —
-#: هیچ مقداری حدسی نیست:
-#:   transport/shadowsocks/core/cipher.go → streamList (خطوط ۶۲–۷۶)
-#:   transport/ssr/obfs/*.go             → ۶ فراخوانیِ register() درونِ init()
-#:   transport/ssr/protocol/*.go         → ۶ فراخوانیِ register() درونِ init()
-#: مقدارِ بیرونِ رجیستری در mihomo خطای «Obfs %s not supported» یا
-#: «protocol %s not supported» می‌دهد و کلِ فایل را می‌سوزاند، پس drop می‌شود.
+# --- ShadowsocksR ---------------------------------------------------------- #
+# Policy: ssr is emitted to neither converter.
+#
+# sing-box removed it in 1.6.0 and now registers a stub that errors with
+# "ShadowsocksR is deprecated and removed in sing-box 1.6.0", rejecting the whole
+# document.
+#
+# Clash was the harder call. Hiddify converts the Clash file with
+# xmdhs/clash2singbox, where `"ssr": "shadowsocksr"` in typeMap is commented out.
+# An unsupported type is skipped but the error is accumulated and returned, and
+# hiddify-core treats any conversion error as fatal. So one ssr node burns the
+# entire clash.yaml. Measured on live output: all/heavy/light all exit 1 with
+# "converting clash to sing-box error: comm: unsupported type ssr", while
+# fast/secure/verified (no ssr) exit 0. After removing ssr all three exit 0 with
+# 10,659 / 9,009 / 2,523 outbounds. 28 ssr nodes were holding 22,191 healthy ones
+# hostage.
+#
+# This is strictly better, not a trade-off: mihomo parses `ssr://` links itself,
+# and those nodes still ship untouched in configs.txt, configs_base64.txt and
+# protocols/shadowsocksr.txt. Only their presence in clash.yaml changes, the one
+# file they made useless for Hiddify.
+#
+# The three sets below are kept because _sanitize_ssr still validates ssr links on
+# the text path; deleting them would remove a real validation. All values are
+# taken verbatim from mihomo v1.19.29 source, nothing is guessed:
+#   transport/shadowsocks/core/cipher.go -> streamList
+#   transport/ssr/obfs/*.go              -> register() calls in init()
+#   transport/ssr/protocol/*.go          -> register() calls in init()
 
-#: ⚠️ اینجا **هیچ رمزِ AEAD نیست** و این عمدی است: `NewShadowSocksR` پس از
-#: `core.PickCipher` یک type-assertion به `*core.StreamCipher` می‌زند
-#: (adapter/outbound/shadowsocksr.go:132) و رمزِ AEAD را با پیامِ «… is not
-#: none or a supported stream cipher in ssr» رد می‌کند. یعنی `SS_CIPHERS`
-#: برای ssr **بیش از حد باز** است و بازاستفاده از آن یک دامِ خاموش می‌ساخت.
-#: «none» را mihomo درونی به «dummy» بدل می‌کند (همان فایل، خط ۱۱۲) و آن
-#: مقایسه حساس‌به‌حروف است، پس مقدار باید حتماً کوچک‌نویس شود.
+#: No AEAD ciphers here, deliberately: NewShadowSocksR type-asserts to
+#: *core.StreamCipher after PickCipher and rejects AEAD with "... is not none or a
+#: supported stream cipher in ssr". So SS_CIPHERS is too permissive for ssr and
+#: reusing it would be a silent trap. mihomo maps "none" to "dummy" internally and
+#: that comparison is case sensitive, hence the lowercasing.
 SSR_CIPHERS: frozenset = frozenset({
     "rc4-md5",
     "aes-128-ctr", "aes-192-ctr", "aes-256-ctr",
@@ -198,148 +162,164 @@ SSR_CIPHERS: frozenset = frozenset({
     "none", "dummy",
 })
 
-#: obfsهای ثبت‌شده در mihomo. «tls1.2_ticket_fastauth» هم‌سازندهٔ
-#: «tls1.2_ticket_auth» است ولی با نامِ جدا ثبت شده، پس هر دو مجازند.
+#: obfs registered in mihomo. tls1.2_ticket_fastauth shares a constructor with
+#: tls1.2_ticket_auth but is registered under its own name, so both are allowed.
 SSR_OBFS: frozenset = frozenset({
     "plain", "http_simple", "http_post", "random_head",
     "tls1.2_ticket_auth", "tls1.2_ticket_fastauth",
 })
 
-#: پروتکل‌های ثبت‌شده در mihomo. زنجیره‌های auth_chain_c…f در بالادستِ ssr
-#: وجود دارند ولی mihomo آن‌ها را **ثبت نکرده**، پس اگر روزی در ورودی دیده
-#: شوند باید drop شوند، نه اینکه منتشر گردند و فایلِ کاربر را بشکنند.
+#: Protocols registered in mihomo. auth_chain_c..f exist upstream in ssr but
+#: mihomo never registered them, so they must be dropped rather than published to
+#: break a user's file.
 SSR_PROTOCOLS: frozenset = frozenset({
     "origin", "auth_sha1_v4", "auth_aes128_md5", "auth_aes128_sha1",
     "auth_chain_a", "auth_chain_b",
 })
 
-#: اثرانگشت‌های uTLS معتبر در sing-box 1.13. مقدار نامعتبر → «unknown uTLS fingerprint».
+#: Valid uTLS fingerprints in sing-box 1.13. An invalid value gives
+#: "unknown uTLS fingerprint".
 UTLS_FINGERPRINTS: frozenset = frozenset({
     "chrome", "firefox", "edge", "safari", "ios", "android",
     "random", "randomized", "qq", "360",
 })
 
-#: اثرانگشت پیش‌فرض وقتی کانفیگ REALITY پارامتر fp ندارد.
-#: sing-box **الزاماً** برای reality به uTLS نیاز دارد؛ نبودش خطای FATAL می‌دهد.
+#: Default fingerprint when a REALITY config has no fp. sing-box *requires* uTLS
+#: for reality; without it the error is fatal.
 DEFAULT_UTLS_FINGERPRINT = "chrome"
 
-#: مقادیر flow که در **هر دو** کلاینت معتبرند.
-#: «xtls-rprx-vision-udp443» فقط در mihomo پذیرفته می‌شود و در sing-box
-#: خطای «unsupported flow» می‌دهد؛ «xtls-rprx-direct/origin» در هیچ‌کدام.
-#: چون یک flow نامعتبر کل فایل را رد می‌کند، فقط مقدار امن را نگه می‌داریم.
+#: flow values valid in *both* clients. "xtls-rprx-vision-udp443" is mihomo-only
+#: and gives "unsupported flow" in sing-box; -direct/-origin work in neither.
+#: Since one invalid flow rejects the whole file, only the safe value is kept.
 VLESS_FLOWS: frozenset = frozenset({"xtls-rprx-vision"})
 
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
+#: tuic congestion controllers accepted by sing-box. Anything else is a load
+#: error that rejects the document, so unknown values fall back to cubic.
+_TUIC_CONGESTION = frozenset({"cubic", "new_reno", "bbr"})
+
+#: Allowed ALPN values. A user-supplied string is not passed through, because a
+#: meaningless value makes the client-side TLS handshake fail.
+_ALPN_ALLOWED = frozenset({"h3", "h2", "http/1.1", "hysteria", "tuic", "quic"})
+
+#: Values that are not hostnames but a textual "empty". The upstream generator
+#: printed a Python or JavaScript None/null straight into the URI. Real case in
+#: live data: `sni=None` (2 occurrences), which also fails DNS.
+_SNI_SENTINELS = frozenset({
+    "none", "null", "undefined", "nil", "nan", "false", "true",
+    "localhost", "0.0.0.0", "127.0.0.1", "::1", "example.com",
+})
+
+#: One hostname label. Underscore is deliberately allowed, see _clean_sni.
+_SNI_LABEL = re.compile(r"^(?!-)[A-Za-z0-9_-]{1,63}(?<!-)$")
+
+
+# --------------------------------------------------------------------------- #
+# Field sanitisers
+# --------------------------------------------------------------------------- #
 
 def _sanitize_flow(flow: str) -> str:
-    """flow نامعتبر را حذف می‌کند (به‌جای اینکه کل فایل را بشکند).
+    """Drop an invalid flow rather than break the whole file.
 
-    نکته: udp443 صرفاً یک بهینه‌سازی مسیر UDP است؛ حذف آن اتصال را از بین
-    نمی‌برد، در حالی که نگه‌داشتنش فایل sing-box را کاملاً بی‌استفاده می‌کند.
+    udp443 is only a UDP path optimisation; removing it does not break the
+    connection, while keeping it makes the sing-box file entirely unusable.
     """
-    f = (flow or "").strip().lower()
-    if f in VLESS_FLOWS:
-        return f
-    if f.startswith("xtls-rprx-vision"):
-        return "xtls-rprx-vision"   # گونه‌های -udp443 → پایهٔ سازگار
+    value = (flow or "").strip().lower()
+    if value in VLESS_FLOWS:
+        return value
+    if value.startswith("xtls-rprx-vision"):
+        return "xtls-rprx-vision"  # -udp443 variants -> the compatible base
     return ""
 
 
 def _sanitize_short_id(sid: str) -> Optional[str]:
-    """short-id رئالیتی باید hex با طول زوج و حداکثر ۱۶ کاراکتر باشد.
+    """REALITY short-id: hex, even length, at most 16 chars.
 
-    None یعنی مقدار خراب است (مثلاً remark به‌اشتباه چسبیده) و کانفیگ باید
-    drop شود؛ هر دو کلاینت با «invalid REALITY short ID» کل فایل را رد می‌کنند.
-    رشتهٔ خالی مجاز است (سرور بدون short-id).
+    None means the value is corrupt (e.g. a remark glued on) and the config must
+    be dropped; both clients reject the whole file with "invalid REALITY short ID".
+    An empty string is legal, meaning a server without a short-id.
     """
-    s = (sid or "").strip()
-    if s == "":
+    value = (sid or "").strip()
+    if value == "":
         return ""
-    if len(s) > 16 or len(s) % 2 != 0:
+    if len(value) > 16 or len(value) % 2 != 0:
         return None
-    if any(ch not in _HEX_DIGITS for ch in s):
+    if any(ch not in _HEX_DIGITS for ch in value):
         return None
-    return s
+    return value
 
 
 def _sanitize_pbk(pbk: str) -> Optional[str]:
-    """کلید عمومی REALITY: base64url بدون padding با طول ۴۳ کاراکتر (۳۲ بایت)."""
-    s = (pbk or "").strip()
-    if len(s) != 43:
+    """REALITY public key: unpadded base64url, 43 chars, decoding to 32 bytes."""
+    value = (pbk or "").strip()
+    if len(value) != 43:
         return None
     try:
-        if len(base64.urlsafe_b64decode(s + "=")) != 32:
+        if len(base64.urlsafe_b64decode(value + "=")) != 32:
             return None
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
-    return s
+    return value
 
 
-def _sanitize_ss(cipher: str, password: str) -> Optional[tuple]:
-    """اعتبارسنجی جفت (cipher, password) شادوساکس.
+def _sanitize_ss(cipher: str, password: str) -> Optional[Tuple[str, str]]:
+    """Validate a shadowsocks (cipher, password) pair.
 
-    None برمی‌گرداند اگر کانفیگ در کلاینت واقعی fail می‌شود — که یعنی باید
-    drop شود تا کل فایل خراب نشود.
+    None means a real client would fail on it, so it must be dropped rather than
+    corrupt the whole file.
     """
     cipher = (cipher or "").strip().lower()
-    if cipher not in SS_CIPHERS:
+    if cipher not in SS_CIPHERS or not password:
         return None
-    if not password:
-        return None
-    need = SS2022_KEY_BYTES.get(cipher)
-    if need is not None:
-        # SS-2022: کلید باید base64 با طول دقیق باشد.
-        # فرم چندکاربره «PSK:PSK» هم مجاز است (هر بخش جداگانه بررسی می‌شود).
+    needed = SS2022_KEY_BYTES.get(cipher)
+    if needed is not None:
+        # SS-2022 keys are base64 of an exact length. The multi-user "PSK:PSK"
+        # form is allowed, each part checked separately.
         for part in password.split(":"):
             try:
-                raw = base64.b64decode(part + "=" * ((4 - len(part) % 4) % 4), validate=False)
-            except Exception:
+                raw = base64.b64decode(
+                    part + "=" * ((4 - len(part) % 4) % 4), validate=False)
+            except Exception:  # noqa: BLE001
                 return None
-            if len(raw) != need:
+            if len(raw) != needed:
                 return None
     return cipher, password
 
 
-def _ub64_text(s: Optional[str], *, allow_empty: bool = False) -> Optional[str]:
-    """base64 (استاندارد یا url-safe، با یا بدونِ padding) → متنِ UTF-8.
+def _ub64_text(value: Optional[str], *, allow_empty: bool = False) -> Optional[str]:
+    """base64 (standard or url-safe, padded or not) -> UTF-8 text.
 
-    عمداً **سخت‌گیرانه** است: اگر بایت‌ها UTF-8 معتبر نباشند `None` می‌دهد و
-    برخلافِ جاهای دیگرِ این ماژول با «errors=ignore» بی‌صدا مثله نمی‌کند.
-    دلیل: این تابع گذرواژهٔ ssr را می‌خواند و یک گذرواژهٔ نیمه‌خورده کانفیگی
-    می‌سازد که «معتبر به‌نظر می‌رسد ولی هرگز وصل نمی‌شود» — بدترین حالت برای
-    کاربر. (اندازه‌گیری روی پیکرهٔ واقعی: ۲۸/۲۸ خطِ ssr با رمزگشاییِ سخت سالم‌اند
-    و همه ASCII، پس این سخت‌گیری امروز هیچ کانفیگی را قربانی نمی‌کند.)
+    Deliberately strict: invalid UTF-8 returns None instead of being silently
+    truncated with errors="ignore" like elsewhere in this module. This reads the
+    ssr password, and a half-decoded password produces a config that looks valid
+    and never connects, the worst outcome for a user. Measured: all 28 live ssr
+    lines decode cleanly and are pure ASCII, so this strictness costs nothing today.
 
-    `allow_empty=True` برای پارامترهای اختیاری است که «نبودن» حالتِ مجازشان
-    است؛ آن‌جا رشتهٔ تهی برمی‌گردد نه `None`، تا فراخواننده بتواند «نبود» را از
-    «خرابی» تشخیص دهد.
+    ``allow_empty=True`` is for optional parameters where absence is legal; it
+    returns "" so the caller can tell "absent" from "corrupt".
     """
-    s = (s or "").strip()
-    if not s:
+    text = (value or "").strip()
+    if not text:
         return "" if allow_empty else None
-    s = s.replace("-", "+").replace("_", "/")
-    s += "=" * ((4 - len(s) % 4) % 4)
+    text = text.replace("-", "+").replace("_", "/")
+    text += "=" * ((4 - len(text) % 4) % 4)
     try:
-        return base64.b64decode(s, validate=False).decode("utf-8")
-    except Exception:
+        return base64.b64decode(text, validate=False).decode("utf-8")
+    except Exception:  # noqa: BLE001
         return None
 
 
-def _sanitize_ssr(cipher: str, password: str,
-                  obfs: str, protocol: str) -> Optional[tuple]:
-    """اعتبارسنجیِ چهارگانهٔ ShadowsocksR بر پایهٔ رجیستریِ واقعیِ mihomo.
+def _sanitize_ssr(cipher: str, password: str, obfs: str,
+                  protocol: str) -> Optional[Tuple[str, str, str, str]]:
+    """Validate all four ssr fields against mihomo's actual registry.
 
-    `None` یعنی mihomo این کانفیگ را رد می‌کند و **کلِ** فایل را می‌سوزاند، پس
-    باید drop شود. هر سه مقدار کوچک‌نویس برمی‌گردند چون هر ۲۲ نامِ ثبت‌شده در
-    سورسِ mihomo کوچک‌نویس است و `PickObfs`/`PickProtocol` هیچ نرمال‌سازیِ
-    حروف ندارند (تنها `PickCipher` بزرگ‌نویس می‌کند) — پس کوچک‌نویسی هم لازم
-    است و هم بی‌خطر.
+    None means mihomo rejects the config and burns the whole file, so it must be
+    dropped. All values are lowercased, because every registered name in mihomo is
+    lowercase and PickObfs/PickProtocol do no case normalisation.
     """
     cipher = (cipher or "").strip().lower()
-    if cipher not in SSR_CIPHERS:
-        return None
-    if not password:
+    if cipher not in SSR_CIPHERS or not password:
         return None
     obfs = (obfs or "").strip().lower()
     if obfs not in SSR_OBFS:
@@ -350,62 +330,233 @@ def _sanitize_ssr(cipher: str, password: str,
     return cipher, password, obfs, protocol
 
 
-def _b64_json(b64: str) -> Optional[dict]:
+def _b64_json(value: str) -> Optional[dict]:
     try:
-        b64 = b64.strip()
-        b64 += "=" * ((4 - len(b64) % 4) % 4)
-        return json.loads(base64.b64decode(b64).decode("utf-8", errors="ignore"))
-    except Exception:
+        text = value.strip()
+        text += "=" * ((4 - len(text) % 4) % 4)
+        return json.loads(base64.b64decode(text).decode("utf-8", errors="ignore"))
+    except Exception:  # noqa: BLE001
         return None
 
 
-def _safe_int(v: Any, default: int = 0) -> int:
+def _safe_int(value: Any, default: int = 0) -> int:
     try:
-        return int(v)
-    except Exception:
+        return int(value)
+    except Exception:  # noqa: BLE001
         return default
 
 
 def _remark_of(line: str) -> str:
-    if "#" in line:
-        try:
-            return urllib.parse.unquote(line.split("#", 1)[1]).strip()
-        except Exception:
-            return line.split("#", 1)[1].strip()
-    return ""
+    if "#" not in line:
+        return ""
+    fragment = line.split("#", 1)[1]
+    try:
+        return urllib.parse.unquote(fragment).strip()
+    except Exception:  # noqa: BLE001
+        return fragment.strip()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Parse → dict واسط (نمایش یکنواخت پروتکل)
-# ──────────────────────────────────────────────────────────────────────────────
+def _truthy(value: Any) -> bool:
+    """Interpret textual yes/no flags in a URI.
 
-# ──────────────────────────────────────────────────────────────────────────────
-# شمارشِ کانفیگ‌های حذف‌شده در تبدیل
+    Sources write "1", "true" and "yes" for the same meaning. Accepting only one
+    silently reads the others as "no", so the client rejects a certificate the
+    server expected it to accept.
+    """
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _alpn_list(raw: Any) -> List[str]:
+    """Comma-separated alpn string -> cleaned list.
+
+    Unknown values are discarded rather than passed through: a meaningless ALPN
+    fails the TLS handshake and the user reads that as "broken config".
+    """
+    if not raw:
+        return []
+    out: List[str] = []
+    for part in str(raw).split(","):
+        value = urllib.parse.unquote(part).strip().lower()
+        if value in _ALPN_ALLOWED and value not in out:
+            out.append(value)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Server address validation
+# --------------------------------------------------------------------------- #
+
+def _is_unroutable_server(host: Any) -> bool:
+    """Whether the server address is inherently unconnectable.
+
+    Unrelated to SNI; this is a separate upstream defect where the server address
+    is 127.0.0.1 or 0.0.0.0, so the client connects to itself. Measured 32
+    occurrences on live output, including 127.0.0.53 x20, which is
+    systemd-resolved's local resolver: the upstream generator printed its own DNS
+    address instead of the server's. Keeping them only inflates the counts, so
+    they are dropped and counted in the drop telemetry.
+
+    A non-IP hostname is not rejected here; judging that needs DNS. Its
+    *structural* shape is checked by _is_structurally_invalid_server.
+    """
+    text = str(host or "").strip().strip("[]")
+    if not text:
+        return True
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError:
+        return False  # a hostname, not an IP; not judged here
+    return bool(address.is_loopback or address.is_unspecified
+                or address.is_multicast or address.is_reserved
+                or address.is_link_local)
+
+
+def _is_structurally_invalid_server(host: Any) -> bool:
+    """Whether the server address cannot possibly be a hostname.
+
+    Sibling of _clean_sni but on a different field: _clean_sni only cleaned `sni`
+    and `host`, while `server`, the address the client actually dials, was never
+    shape-checked. Advertising and placeholder values therefore reached client
+    files. Measured on live output (8,152 configs), 6 configs:
+
+        trojan 'masir_sefid', vless 'black_raven_ir', vless 'ip', vless '',
+        vmess 'https://github.com/ALIILAPRO/v2rayNG-Config',
+        vmess a Chinese advertising string
+
+    Four of the six were present in the published client files, 16 occurrences
+    across 6 files.
+
+    Reject rather than repair, and DNS proved it: all six fail with gaierror, and
+    the only possible repair for the URL case is `github.com`, which is the wrong
+    destination entirely, so the client would dial GitHub instead of a proxy.
+    Corroborating evidence: that row's uuid is "aliilapro-v2rayng-config", so the
+    row is a repo advertisement, not a server.
+
+    A single label with no dot is rejected because it only resolves on a local
+    network with a search domain, never for an internet proxy.
+
+    Not rejected: IPs, v4 or v6, bracketed or not. An IPv6 literal has no
+    structural dot, and judging IP addresses is _is_unroutable_server's job.
+    Underscores stay legal because names like
+    `TM_AZARBAYJAB1.new.99.workers.dev` really do resolve.
+    """
+    text = str(host or "").strip()
+    if not text:
+        return True
+    try:
+        ipaddress.ip_address(text.strip("[]"))
+        return False
+    except ValueError:
+        pass
+    # Signs the value is a URL, a path or free text rather than a hostname.
+    if any(ch in text for ch in ("/", "?", "#", "@", "\\")) or "://" in text:
+        return True
+    if any(ch.isspace() for ch in text):
+        return True
+    if ":" in text:  # leftover port on a non-IPv6 name
+        return True
+    if "." not in text:  # single label, never resolves on the internet
+        return True
+    if len(text) > 253:
+        return True
+    return not all(_SNI_LABEL.match(label)
+                   for label in text.rstrip(".").split("."))
+
+
+def _clean_sni(raw: Any) -> str:
+    """Clean an SNI value: repair first, then reject.
+
+    Real live input: `sni=https%3A%2F%2Ft.me%2Foneclickvpnkeys`, an advertising URL
+    sitting where a hostname belongs. Both clients *load* it fine (verified,
+    rc=0), so the file does not break, but the TLS handshake fails at connect time
+    and the user sees "broken config" with no explanation. Dropping a meaningless
+    SNI is better: the client then falls back to the server's own name.
+
+    Repair before judging, because measurement showed many "invalid" values are
+    correct hostnames carrying one extra character::
+
+        $$hn.xiaohouzi.club     gaierror, while hn.xiaohouzi.club resolves
+        world.yahoo.com:443     glued port, the name itself is valid
+        .afrcloud22.mmv.kr      leading dot, resolves without it
+        t.me%2Fripaojiedian     double-encoded, inherently a URL, unrepairable
+
+    So: multi-layer percent-decode, strip a glued port, strip a source-marker `$`,
+    strip leading/trailing dots, and only then judge. A/B over three output
+    categories: old rule 2,593 unique values / 8,779 occurrences, new rule 2,625 /
+    8,876 (+97), with 59 values repaired in place and 4 newly rejected. Each of
+    those 4 was DNS-tested and none resolves.
+
+    Underscore is allowed, tested rather than argued: RFC 1123 disallows it, but
+    `TM_AZARBAYJAB1.new.99.workers.dev` resolves to 104.21.61.74. It is also not
+    rewritten to a hyphen, because the TLS certificate was issued for the original
+    name.
+
+    A trailing dot is stripped rather than rejected: `wwwuk.mobilex55.com.`
+    resolves, but RFC 6066 section 3 says the server_name extension carries the
+    name without a trailing dot.
+
+    A dotless name is rejected: `Telegram-Leviko_v2ray` is a channel name, has no
+    dot and does not resolve.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+
+    # Multi-layer percent-decode: live data contains both %2F and %252F.
+    for _ in range(3):
+        decoded = urllib.parse.unquote(text)
+        if decoded == text:
+            break
+        text = decoded
+    text = text.strip()
+
+    text = re.sub(r":\d{1,5}$", "", text)  # glued port
+    text = text.strip("$").strip(".").strip()  # source marker, edge dots
+
+    if not text or len(text) > 253:
+        return ""
+    if text.lower() in _SNI_SENTINELS:
+        return ""
+    # A URL, path or userinfo is never repairable.
+    if any(ch in text for ch in ("://", "/", "?", "@", " ", ":")):
+        return ""
+
+    labels = text.split(".")
+    if len(labels) < 2:
+        return ""
+    if not all(_SNI_LABEL.match(label) for label in labels):
+        return ""
+    return text
+
+
+# --------------------------------------------------------------------------- #
+# Drop accounting
 #
-# چرا لازم است: تا پیش از این، هر کانفیگی که مبدل نمی‌توانست بیان کند بی‌صدا
-# رد می‌شد. اندازه‌گیریِ واقعی روی ۸۰۱۷ کانفیگِ زندهٔ همین مخزن (پس از افزودنِ
-# پشتیبانیِ hysteria2 و tuic) نشان داد این حذفِ خاموش کوچک نیست:
+# Before this, any config a converter could not express was dropped silently.
+# Measured on 8,017 live configs (after hysteria2/tuic support landed):
+#   Clash    68 drops  -> unparsable 60, not_expressible 8
+#   Sing-box 313 drops -> unparsable 60, not_expressible 253
+# Nobody knew those numbers, because there was neither a log nor a counter. A user
+# importing the Clash file after reading "8,017 configs" in the README sees a
+# different number and cannot find out why. The largest item, 240 vless drops in
+# sing-box, had only ever been suspected.
 #
-#   Clash   : ۶۸ حذف  → unparsable=۶۰ ، not_expressible=۸
-#             به تفکیکِ پروتکل: ss=۳۰ ، ssr=۲۸ ، vless=۵ ، trojan=۳ ، vmess=۲
-#   Sing-box: ۳۱۳ حذف → unparsable=۶۰ ، not_expressible=۲۵۳
-#             به تفکیکِ پروتکل: vless=۲۴۰ ، ss=۳۰ ، ssr=۲۸ ، trojan=۱۲ ، vmess=۳
-#
-# هیچ‌کس این عددها را نمی‌دانست، چون نه لاگی بود نه شمارشی. کاربری که فایلِ
-# Clash را وارد می‌کند و «۸۰۱۷ کانفیگ» را در توضیحاتِ مخزن خوانده، عددِ دیگری
-# می‌بیند و دلیلش را نمی‌فهمد. بزرگ‌ترین قلم — ۲۴۰ عدد vless در Sing-box — همان
-# حذفِ مشکوکِ قدیمی بود که تا امروز فقط گمان می‌رفت و حالا اندازه‌گیری شده است.
-#
-# با ثبتِ علتِ حذف، این عددها به health.json می‌روند و قابلِ پیگیری می‌شوند:
-# اگر فردا یک تغییر باعث شود ۲۰۰۰ کانفیگ حذف شود، در گزارش دیده می‌شود.
-# ──────────────────────────────────────────────────────────────────────────────
+# Recording the reason puts these numbers into health.json, so a change that
+# suddenly drops 2,000 configs shows up in the report.
+# --------------------------------------------------------------------------- #
+
+REASON_UNPARSABLE = "unparsable"
+REASON_UNROUTABLE = "unroutable_server"
+REASON_INVALID_SERVER = "invalid_server"
+REASON_NOT_EXPRESSIBLE = "not_expressible"
+REASON_OVER_LIMIT = "over_limit"
+
 
 class _DropRecorder:
-    """
-    شمارشگرِ علت‌های حذف، به تفکیکِ مبدل و پروتکل.
+    """Counts drop reasons per target and protocol.
 
-    عمداً فقط *شمارش* می‌کند و خودِ کانفیگ‌ها را نگه نمی‌دارد: نگه‌داشتنِ هزاران
-    رشته در حافظه سودی ندارد و گزارش را هم بی‌جهت بزرگ می‌کند.
+    Counts only; the configs themselves are not retained. Holding thousands of
+    strings in memory gains nothing and would bloat the report.
     """
 
     def __init__(self) -> None:
@@ -416,22 +567,24 @@ class _DropRecorder:
 
     def record(self, target: str, reason: str, line: str,
                proto: Optional[str] = None) -> None:
-        d = self.data.setdefault(
+        entry = self.data.setdefault(
             target, {"total": 0, "by_reason": {}, "by_protocol": {}})
-        d["total"] += 1
-        d["by_reason"][reason] = d["by_reason"].get(reason, 0) + 1
+        entry["total"] += 1
+        entry["by_reason"][reason] = entry["by_reason"].get(reason, 0) + 1
         key = proto or _scheme_of(line)
         if key:
-            d["by_protocol"][key] = d["by_protocol"].get(key, 0) + 1
+            entry["by_protocol"][key] = entry["by_protocol"].get(key, 0) + 1
 
     def snapshot(self) -> Dict[str, Dict[str, Any]]:
-        """کپیِ آمار برای درج در گزارشِ سلامت."""
+        """Copy of the stats, for the health report."""
         return {
-            t: {"total": v["total"],
-                "by_reason": dict(sorted(v["by_reason"].items())),
-                "by_protocol": dict(sorted(v["by_protocol"].items(),
-                                           key=lambda kv: (-kv[1], kv[0])))}
-            for t, v in sorted(self.data.items())
+            target: {
+                "total": entry["total"],
+                "by_reason": dict(sorted(entry["by_reason"].items())),
+                "by_protocol": dict(sorted(entry["by_protocol"].items(),
+                                           key=lambda kv: (-kv[1], kv[0]))),
+            }
+            for target, entry in sorted(self.data.items())
         }
 
 
@@ -439,343 +592,276 @@ _drops = _DropRecorder()
 
 
 def _scheme_of(line: str) -> str:
-    """schemeی خامِ یک خط، برای دسته‌بندیِ حذف‌ها وقتی نوع تحلیل نشده است."""
-    s = (line or "").strip()
-    i = s.find("://")
-    return s[:i].lower() if 0 < i < 20 else ""
+    """Raw scheme of a line, for grouping drops when the type is unknown."""
+    text = (line or "").strip()
+    index = text.find("://")
+    return text[:index].lower() if 0 < index < 20 else ""
 
 
 def drop_stats() -> Dict[str, Dict[str, Any]]:
-    """آمارِ حذف‌های آخرین تبدیل. خطِ لوله آن را در health.json می‌نویسد."""
+    """Drop stats from the most recent conversion, written to health.json."""
     return _drops.snapshot()
 
 
-#: حالت‌های کنترلِ ازدحامِ پذیرفته‌شده در tuic. مقدارِ خارج از این مجموعه در
-#: sing-box خطای بارگذاری می‌دهد و کلِ سند را رد می‌کند، پس به «cubic» می‌افتد.
-_TUIC_CONGESTION = frozenset({"cubic", "new_reno", "bbr"})
+# --------------------------------------------------------------------------- #
+# Parsing: URI -> intermediate dict
+# --------------------------------------------------------------------------- #
 
-#: مقادیرِ ALPN مجاز. رشتهٔ دلخواهِ کاربر مستقیم عبور داده نمی‌شود چون یک مقدارِ
-#: بی‌معنا باعث می‌شود دست‌دادنِ TLS در سمتِ کلاینت شکست بخورد.
-_ALPN_ALLOWED = frozenset({"h3", "h2", "http/1.1", "hysteria", "tuic", "quic"})
+def _parse_vmess(line: str) -> Optional[Dict[str, Any]]:
+    """Parse a base64 vmess URI.
 
+    Name resolution order is fragment, then `ps`, then a branded fallback. vmess
+    used to be the only branch reading its inner `ps` directly while the other six
+    read the fragment, and that exception produced a measured defect: when the
+    base64 body contains an out-of-alphabet character, core.brand_remark falls back
+    to rewriting only the `#...` fragment, so a stale `ps` shipped unbranded to
+    clash and sing-box. Live measurement: 1 node out of 9,706 advertising a rival
+    channel.
 
-#: مقادیرِ نگهبان (sentinel) که «نامِ میزبان» نیستند بلکه «مقدارِ تهی» را در
-#: قالبِ متن بیان می‌کنند. تولیدکنندهٔ بالادست یک `None`/`null` پایتونی یا
-#: جاوااسکریپتی را مستقیم در URI چاپ کرده. مصداقِ واقعیِ سنجیده‌شده در دادهٔ
-#: زنده: `sni=None` (۲ مورد) — و `None` در DNS هم شکست می‌خورد (gaierror).
-_SNI_SENTINELS = frozenset({
-    "none", "null", "undefined", "nil", "nan", "false", "true",
-    "localhost", "0.0.0.0", "127.0.0.1", "::1", "example.com",
-})
-
-#: یک برچسبِ (label) نامِ میزبان. زیرخط عمداً مجاز است — بندِ توضیحی پایین.
-_SNI_LABEL = re.compile(r"^(?!-)[A-Za-z0-9_-]{1,63}(?<!-)$")
-
-
-def _is_unroutable_server(host: Any) -> bool:
+    `ps` is not dropped like ssr's `remarks`, because 2,980 real nodes take their
+    branded, country-tagged name from `ps` (they have no fragment). So this is an
+    order, not a replacement. _remark_of already unquotes and strips, so an
+    empty or whitespace fragment defers to `ps`.
     """
-    آیا نشانیِ سرور ذاتاً غیرقابلِ‌اتصال است؟
+    obj = _b64_json(line[8:].split("#")[0])
+    if not obj:
+        return None
+    security = str(obj.get("tls") or "").lower()
+    path = str(obj.get("path") or "")
+    return {
+        "type": "vmess",
+        "name": (_remark_of(line)
+                 or str(obj.get("ps") or obj.get("name") or "")
+                 or _branded_fallback("vmess")),
+        "server": str(obj.get("add") or ""),
+        "port": _safe_int(obj.get("port")),
+        "uuid": str(obj.get("id") or ""),
+        "alterId": _safe_int(obj.get("aid"), 0),
+        "cipher": str(obj.get("scy") or "auto"),
+        "network": (str(obj.get("net") or "tcp") or "tcp").lower(),
+        "tls": security in ("tls", "reality"),
+        # These three used to pass through raw while _clean_sni was applied only
+        # to hysteria2/tuic. Live output had 431 structurally invalid hostname
+        # values across vmess/vless/trojan. Every hostname input now goes through
+        # one gate.
+        "sni": _clean_sni(obj.get("sni") or obj.get("host")),
+        "host": _clean_sni(obj.get("host")),
+        "path": path,
+        # For grpc, vmess uses `type` as serviceName and path usually carries it.
+        "servicename": path.lstrip("/"),
+        "fp": str(obj.get("fp") or "").lower(),
+        "reality": security == "reality",
+        "mode": str(obj.get("mode") or ""),
+        "extra": str(obj.get("extra") or ""),
+    }
 
-    این *بی‌ربط* به SNI است و یک نقصِ جداگانهٔ بالادست: بعضی کانفیگ‌ها نشانیِ
-    سرورشان `127.0.0.1` یا `0.0.0.0` است. چنین کانفیگی روی دستگاهِ کاربر هرگز
-    وصل نمی‌شود — کلاینت به خودش وصل می‌شود. اندازه‌گیریِ واقعی روی خروجیِ زنده
-    (پیش از این بند)، در سه دسته ۳۲ رخداد:
 
-        all    127.0.0.1  ×۵    127.0.0.53 ×۱۰   0.0.0.0 ×۱
-        heavy  127.0.0.1  ×۲                     0.0.0.0 ×۱
-        light  127.0.0.1  ×۳    127.0.0.53 ×۱۰
+def _parse_shadowsocks(line: str, scheme: str, name: str) -> Optional[Dict[str, Any]]:
+    """Parse SIP002 ``ss://base64(method:pass)@host:port`` and the plain form."""
+    rest = line[len(scheme) + 3:].split("#")[0]
+    method = password = ""
+    host = ""
+    port = 0
 
-    `127.0.0.53` نشانیِ حل‌کنندهٔ محلیِ systemd-resolved است؛ یعنی تولیدکنندهٔ
-    بالادست به‌جای نشانیِ سرور، نشانیِ DNSِ خودش را چاپ کرده. نگه‌داشتنشان تنها
-    آمار را باد می‌کند و کاربر را سرِ کار می‌گذارد، پس drop می‌شوند و در
-    تلمتریِ drop هم شمرده می‌شوند تا عدد قابلِ‌ردیابی بماند.
+    if "@" in rest:
+        userinfo, hostpart = rest.rsplit("@", 1)
+        hostpart = hostpart.split("?")[0]
+        try:
+            decoded = base64.urlsafe_b64decode(userinfo + "==").decode(
+                "utf-8", errors="ignore")
+            if ":" in decoded:
+                userinfo = decoded
+        except Exception:  # noqa: BLE001
+            pass
+        userinfo = urllib.parse.unquote(userinfo)
+        if ":" in userinfo:
+            method, password = userinfo.split(":", 1)
+        host, _, port_text = hostpart.rpartition(":")
+        port = _safe_int(port_text)
+    else:
+        try:
+            decoded = base64.urlsafe_b64decode(rest + "==").decode(
+                "utf-8", errors="ignore")
+            credentials, _, hostpart = decoded.rpartition("@")
+            if ":" in credentials:
+                method, password = credentials.split(":", 1)
+            host, _, port_text = hostpart.rpartition(":")
+            port = _safe_int(port_text)
+        except Exception:  # noqa: BLE001
+            return None
 
-    نکته: نامِ میزبانِ *غیرِ* IP این‌جا رد نمی‌شود؛ داوری دربارهٔ آن به DNS نیاز
-    دارد و در زمانِ تبدیل انجام نمی‌شود. شکلِ *ساختاریِ* نامِ میزبان جداگانه در
-    `_is_structurally_invalid_server` سنجیده می‌شود.
+    if not host or not port:
+        return None
+    # Strict validation: an invalid cipher, e.g. a UUID landing where the method
+    # belongs, breaks the entire Clash/sing-box file for the user.
+    validated = _sanitize_ss(method, password)
+    if not validated:
+        return None
+    method, password = validated
+    return {"type": "shadowsocks", "name": name, "server": host, "port": port,
+            "cipher": method, "password": password}
+
+
+def _parse_ssr(line: str, name: str) -> Optional[Dict[str, Any]]:
+    """Parse ``ssr://base64(host:port:protocol:method:obfs:base64(pass)/?params)``.
+
+    Unlike the other schemes the whole body is base64, so it is decoded by hand
+    like the ss branch. Splitting on "#" is safe because "#" is in neither base64
+    alphabet.
     """
-    s = str(host or "").strip().strip("[]")
-    if not s:
-        return True
-    try:
-        ip = ipaddress.ip_address(s)
-    except ValueError:
-        return False          # نامِ میزبان است، نه IP — این‌جا داوری نمی‌کنیم
-    return bool(ip.is_loopback or ip.is_unspecified or ip.is_multicast
-                or ip.is_reserved or ip.is_link_local)
+    raw = _ub64_text(line[len("ssr://"):].split("#", 1)[0])
+    if raw is None:
+        return None
+    main, _sep, query = raw.partition("/?")
+    parts = main.split(":")
+    if len(parts) != 6:
+        # Six parts are mandatory in the ssr spec. This also rejects IPv6 hosts,
+        # because ":" breaks the count, and that is correct: the ssr spec defines
+        # no IPv6 form, so such a line is meaningless to mihomo too.
+        return None
+    host, port_text, protocol, method, obfs, password_b64 = parts
+    port = _safe_int(port_text)
+    password = _ub64_text(password_b64)
+    if password is None or not host or not port:
+        return None
+    # Port range is deliberately not checked here: filters.is_invalid_port owns
+    # that rule, and duplicating it would create two diverging truths.
+    validated = _sanitize_ssr(method, password, obfs, protocol)
+    if not validated:
+        return None
+    method, password, obfs, protocol = validated
+
+    params = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+    # The inner base64 `remarks` is deliberately unused for the name: the pipeline
+    # applies core.brand_remark before building output, so a branded "#..." always
+    # exists in production and _remark_of wins. Reading remarks would be dead code.
+    #
+    # Optional params: corrupt base64 must not drop the whole config, but it must
+    # not silently become "" either, or the user thinks obfuscation is on. Empty
+    # means the key is simply not written to the YAML.
+    return {
+        "type": "shadowsocksr",
+        "name": name,
+        "server": host,
+        "port": port,
+        "cipher": method,
+        "password": password,
+        "obfs": obfs,
+        "protocol": protocol,
+        "obfs_param": _ub64_text(params.get("obfsparam"), allow_empty=True) or "",
+        "protocol_param": _ub64_text(params.get("protoparam"),
+                                     allow_empty=True) or "",
+    }
 
 
-def _is_structurally_invalid_server(host: Any) -> bool:
+def _parse_hysteria2(parsed: Any, query: Dict[str, str],
+                     name: str) -> Optional[Dict[str, Any]]:
+    """Parse hysteria2:// or hy2://.
+
+    Both schemes appear in real input (measured 77 and 3), so both are accepted;
+    otherwise three configs would vanish silently.
     """
-    آیا نشانیِ سرور از نظرِ *ساختاری* اصلاً نمی‌تواند نامِ میزبان باشد؟
-
-    این بند خواهرِ `_clean_sni` است ولی روی میدانِ دیگری: `_clean_sni` فقط
-    `sni` و `host` را پاک می‌کند، در حالی که `server` — یعنی همان جایی که
-    کلاینت واقعاً به آن وصل می‌شود — هیچ‌گاه از نظرِ شکل سنجیده نمی‌شد. نتیجه:
-    مقدارهایی که *تبلیغ* یا *جانگهدار* بودند تا انتهای فایلِ کلاینت می‌رسیدند.
-
-    اندازه‌گیریِ واقعی روی خروجیِ زندهٔ CI (کامیتِ `f692efc`، ۸٬۱۵۲ کانفیگ)، با
-    خودِ پارسرِ همین ماژول — **۶ کانفیگ**:
-
-        trojan  'masir_sefid'                                   (تک‌برچسب)
-        vless   'black_raven_ir'                                (تک‌برچسب)
-        vless   'ip'                                            (تک‌برچسب)
-        vless   ''                                              (تهی)
-        vmess   'https://github.com/ALIILAPRO/v2rayNG-Config'   (کلِ یک URL)
-        vmess   '使用前记得更新订阅'                              (متنِ تبلیغی)
-
-    از این ۶، دو موردِ آخرِ سطرهای «تهی» و «متنِ تبلیغی» پیش‌تر به دلیلِ دیگری
-    (not_expressible) حذف می‌شدند، ولی **۴ موردِ دیگر در فایلِ منتشرشده حاضر
-    بودند**: در `all/` و `light/` و `heavy/` جمعاً ۱۶ رخداد در ۶ فایلِ کلاینت.
-
-    چرا «ترمیم» نه، «رد»؟ — همان قاعدهٔ `_clean_sni` («ترمیم کن، بعد رد کن») این
-    بار به رد می‌رسد، و این با DNS اثبات شد نه با حدس. هر ۶ مقدار در DNS
-    شکست می‌خورند (`gaierror`)، و تنها ترمیمِ ممکن برای موردِ URL این است که به
-    `github.com` تبدیل شود — که **مقصدِ درستی نیست**: کلاینت به‌جای پروکسی به
-    خودِ GitHub وصل می‌شود. یعنی ترمیم این‌جا کانفیگی می‌سازد که «معتبر به‌نظر
-    می‌رسد ولی هرگز کار نمی‌کند» — همان چیزی که قاعدهٔ طلاییِ این ماژول منع
-    می‌کند. شاهدِ تکمیلی: `uuid` همان کانفیگ `aliilapro-v2rayng-config` است،
-    که اصلاً UUID نیست — پس این ردیف یک تبلیغِ مخزن است، نه یک سرور.
-
-    چرا «تک‌برچسب» (نداشتنِ نقطه) رد می‌شود؟ نامِ میزبانِ بدونِ نقطه فقط در
-    شبکهٔ محلی (با پسوندِ search domain) معنا دارد؛ برای یک پروکسیِ اینترنتی
-    هرگز حل نمی‌شود. هر سه نمونهٔ زنده هم همین را تأیید کردند.
-
-    آنچه عمداً رد **نمی‌شود**: IP (چه v4 چه v6، با یا بدون `[]`) — چون IP نقطه‌ی
-    ساختاری‌اش را ممکن است نداشته باشد (IPv6) و داوریِ نشانیِ IP کارِ
-    `_is_unroutable_server` است. زیرخط در برچسب مجاز می‌ماند، چون در سنجشِ
-    واقعی نام‌هایی مثل `TM_AZARBAYJAB1.new.99.workers.dev` **حل می‌شوند**.
-    """
-    s = str(host or "").strip()
-    if not s:
-        return True
-    # IP (شاملِ IPv6 با یا بدونِ کروشه) ساختاراً معتبر است؛ داوری‌اش جای دیگری‌ست
-    try:
-        ipaddress.ip_address(s.strip("[]"))
-        return False
-    except ValueError:
-        pass
-    # نشانه‌های اینکه مقدار یک URL/مسیر/متن است، نه نامِ میزبان
-    if any(ch in s for ch in ("/", "?", "#", "@", "\\")) or "://" in s:
-        return True
-    if any(ch.isspace() for ch in s):
-        return True
-    if ":" in s:                      # باقی‌ماندهٔ پورت روی نامِ غیرِ IPv6
-        return True
-    if "." not in s:                  # تک‌برچسب — روی اینترنت حل نمی‌شود
-        return True
-    if len(s) > 253:
-        return True
-    labels = s.rstrip(".").split(".")
-    return not all(_SNI_LABEL.match(x) for x in labels)
+    if not parsed.hostname or not parsed.port:
+        return None
+    # The password may arrive in userinfo with or without a user part.
+    password = urllib.parse.unquote(parsed.username or "")
+    if parsed.password:
+        extra = urllib.parse.unquote(parsed.password)
+        password = f"{password}:{extra}" if password else extra
+    if not password:
+        return None
+    obfs = (query.get("obfs") or "").strip().lower()
+    # Only salamander is standard in hysteria2. An unknown value is ignored so
+    # the client does not reject the whole file.
+    if obfs and obfs != "salamander":
+        obfs = ""
+    return {
+        "type": "hysteria2",
+        "name": name,
+        "server": parsed.hostname,
+        "port": _safe_int(parsed.port),
+        "password": password,
+        "sni": _clean_sni(query.get("sni") or query.get("peer")),
+        "insecure": _truthy(query.get("insecure") or query.get("allowInsecure")
+                            or query.get("allow_insecure")),
+        "obfs": obfs,
+        "obfs_password": urllib.parse.unquote(
+            query.get("obfs-password") or query.get("obfs_password") or ""),
+        "alpn": _alpn_list(query.get("alpn")),
+        "tls": True,  # hysteria2 is always QUIC/TLS
+    }
 
 
-def _clean_sni(raw: Any) -> str:
-    """
-    پاک‌سازیِ SNI — «ترمیم کن، بعد رد کن».
-
-    نمونهٔ واقعی از ورودیِ زنده: `sni=https%3A%2F%2Ft.me%2Foneclickvpnkeys`.
-    این یک نشانیِ تبلیغاتی است که در جای نامِ میزبان نشسته. هر دو کلاینت آن را
-    هنگامِ *بارگذاری* می‌پذیرند (آزمون شد: mihomo و sing-box هر دو rc=0)، پس
-    فایل نمی‌شکند؛ ولی هنگامِ *اتصال* دست‌دادنِ TLS شکست می‌خورد و کاربر آن را
-    «کانفیگِ خراب» می‌بیند بدون اینکه بداند چرا. حذفِ SNI بی‌معنا بهتر است:
-    کلاینت آن‌گاه به نامِ خودِ سرور برمی‌گردد که حداقل یک نامِ واقعی است.
-
-    ▲ چرا نسخهٔ نخست کافی نبود
-    ─────────────────────────
-    نسخهٔ نخست فقط *رد* می‌کرد. اندازه‌گیری روی خروجیِ زندهٔ همین مخزن نشان داد
-    بخشِ بزرگی از مقادیرِ «نامعتبر» در واقع نامِ میزبانِ درستی هستند که یک
-    نویسهٔ اضافه دارند، و رد کردنشان یعنی دور ریختنِ SNIِ سالم:
-
-        مقدارِ خام                         حقیقتِ DNS (سنجیده‌شده)
-        ──────────────────────────────    ───────────────────────────────
-        `$$hn.xiaohouzi.club`             gaierror  ← با `$` شکست می‌خورد
-        `hn.xiaohouzi.club`               13.248.169.48 ✓ ← بی `$` کار می‌کند
-        `world.yahoo.com:443`             درگاهِ چسبیده؛ نامش معتبر است
-        `.afrcloud22.mmv.kr`              نقطهٔ ابتدا؛ بی‌آن → 104.26.14.21 ✓
-        `t.me%2Fripaojiedian`             دوبار درصدکد‌شده؛ ذاتاً نشانی است ✗
-
-    پس ترتیبِ درست این است: نخست نویسه‌های زائدِ *ساختاری* را برمی‌داریم
-    (درصدکدگشاییِ چندلایه، درگاهِ چسبیده، `$`ِ نشانگرِ منبع، نقطهٔ ابتدا/انتها)
-    و تنها پس از آن داوری می‌کنیم. سنجشِ A/B روی ۳ دستهٔ خروجی:
-
-        قاعدهٔ پیشین   ۲٬۵۹۳ مقدارِ یکتا / ۸٬۷۷۹ رخداد
-        قاعدهٔ کنونی   ۲٬۶۲۵ مقدارِ یکتا / ۸٬۸۷۶ رخداد      (‎+۹۷ رخداد)
-        ترمیم‌شده در جا      ۵۹ مقدار /   ۲۱۷ رخداد
-        تازه حذف‌شده          ۴ مقدار /    ۲۹ رخداد
-
-    و آن ۴ مقدارِ تازه‌حذف‌شده یکی‌یکی با DNS آزموده شدند؛ هیچ‌کدام resolve
-    نمی‌شوند (`None`, `Telegram-Leviko_v2ray`, `wbjj-bbcs-.MaQRor.Ir`, و یک نامِ
-    غیرASCII) — یعنی حذفشان زیانی ندارد.
-
-    ▲ چرا زیرخط (`_`) مجاز است
-    ─────────────────────────
-    RFC 1123 زیرخط را در نامِ میزبان مجاز نمی‌داند، ولی ما داوریِ کاغذی نمی‌کنیم؛
-    آزمونِ DNS انجام دادیم:
-
-        `TM_AZARBAYJAB1.new.99.workers.dev`  →  104.21.61.74 ✓
-        `TM-AZARBAYJAB1.new.99.workers.dev`  →  104.21.61.74 ✓
-
-    نامِ زیرخط‌دار واقعاً resolve می‌شود، پس ردش کردن یعنی خرابِ‌کردنِ کانفیگِ
-    سالم. زیرخط را نگه می‌داریم و آن را به خط‌تیره هم *تبدیل نمی‌کنیم*، چون
-    گواهیِ TLS بر پایهٔ نامِ اصلی صادر شده.
-
-    ▲ چرا نقطهٔ پایانی برداشته می‌شود
-    ───────────────────────────────
-    `wwwuk.mobilex55.com.` در DNS کار می‌کند (138.68.140.39) ولی RFC 6066 §3
-    صریح است: نامِ میزبان در افزونهٔ server_name «بدونِ نقطهٔ پایانی» بیان
-    می‌شود. پس این‌جا نقطه را می‌بُریم نه اینکه مقدار را دور بریزیم.
-
-    ▲ چرا نامِ بی‌نقطه رد می‌شود
-    ──────────────────────────
-    `Telegram-Leviko_v2ray` نامِ کانال است نه میزبان؛ نه نقطه دارد و نه resolve
-    می‌شود. یک برچسبِ تنها نمی‌تواند نامِ کاملِ مقصد باشد.
-    """
-    s = str(raw or "").strip()
-    if not s:
-        return ""
-
-    # درصدکدگشاییِ چندلایه: دادهٔ زنده هم `%2F` دارد و هم `%252F`.
-    for _ in range(3):
-        nxt = urllib.parse.unquote(s)
-        if nxt == s:
-            break
-        s = nxt
-    s = s.strip()
-
-    # درگاهِ چسبیده به انتهای نام: `world.yahoo.com:443` → `world.yahoo.com`
-    s = re.sub(r":\d{1,5}$", "", s)
-    # `$`ِ نشانگرِ منبع و نقطهٔ ابتدا/انتها
-    s = s.strip("$").strip(".").strip()
-
-    if not s or len(s) > 253:
-        return ""
-    if s.lower() in _SNI_SENTINELS:
-        return ""
-    # نشانی، مسیر، یا نامِ کاربری هرگز ترمیم‌پذیر نیست
-    if "://" in s or "/" in s or "?" in s or "@" in s or " " in s or ":" in s:
-        return ""
-
-    labels = s.split(".")
-    if len(labels) < 2:
-        return ""
-    if not all(_SNI_LABEL.match(lb) for lb in labels):
-        return ""
-    return s
-
-
-def _truthy(v: Any) -> bool:
-    """
-    تفسیرِ پرچم‌های متنیِ «آری/نه» در URI.
-
-    منابعِ مختلف برای یک معنا سه نگارش می‌نویسند: «1», «true», «yes». اگر فقط
-    یکی را بپذیریم، بقیه خاموشانه «نه» تفسیر می‌شوند و کاربر گواهیِ نامعتبر را
-    رد می‌کند در حالی که سرور انتظارِ پذیرش دارد.
-    """
-    s = str(v or "").strip().lower()
-    return s in ("1", "true", "yes", "on")
-
-
-def _alpn_list(raw: Any) -> list:
-    """
-    رشتهٔ alpn جدا‌شده با کاما → فهرستِ پاک‌سازی‌شده.
-
-    مقادیرِ ناشناخته دور ریخته می‌شوند نه اینکه خام عبور کنند: یک ALPN بی‌معنا
-    باعثِ شکستِ دست‌دادنِ TLS می‌شود و کاربر آن را «کانفیگِ خراب» می‌بیند.
-    """
-    if not raw:
-        return []
-    out: list = []
-    for part in str(raw).split(","):
-        p = urllib.parse.unquote(part).strip().lower()
-        if p in _ALPN_ALLOWED and p not in out:
-            out.append(p)
-    return out
+def _parse_tuic(parsed: Any, query: Dict[str, str],
+                name: str) -> Optional[Dict[str, Any]]:
+    """Parse ``tuic://uuid:password@host:port/?...``."""
+    if not parsed.hostname or not parsed.port:
+        return None
+    uuid = urllib.parse.unquote(parsed.username or "")
+    password = urllib.parse.unquote(parsed.password or "")
+    if not uuid or not password:
+        return None
+    congestion = (query.get("congestion_control")
+                  or query.get("congestion-control")
+                  or query.get("congestion") or "cubic").strip().lower()
+    if congestion not in _TUIC_CONGESTION:
+        congestion = "cubic"
+    relay = (query.get("udp_relay_mode") or query.get("udp-relay-mode")
+             or "native").strip().lower()
+    if relay not in ("native", "quic"):
+        relay = "native"
+    return {
+        "type": "tuic",
+        "name": name,
+        "server": parsed.hostname,
+        "port": _safe_int(parsed.port),
+        "uuid": uuid,
+        "password": password,
+        "congestion_control": congestion,
+        "udp_relay_mode": relay,
+        "sni": _clean_sni(query.get("sni")),
+        "insecure": _truthy(query.get("allow_insecure") or query.get("insecure")
+                            or query.get("allowInsecure")),
+        "alpn": _alpn_list(query.get("alpn")),
+        "tls": True,  # tuic is always QUIC/TLS
+    }
 
 
 def parse_proxy(line: str) -> Optional[Dict[str, Any]]:
-    """یک URI کانفیگ → dict واسط استاندارد یا None."""
+    """One config URI -> the intermediate dict, or None."""
     line = line.strip()
     try:
         if line.startswith("vmess://"):
-            obj = _b64_json(line[8:].split("#")[0])
-            if not obj:
-                return None
-            return {
-                # فاز C12 — اولویتِ fragment، همان قاعدهٔ مشترکِ خطِ ۶۶۶.
-                #
-                # چرا: `parse_proxy` هفت شاخه دارد و **شش** شاخهٔ دیگر
-                # (vless/trojan/ss/ssr/hysteria2/tuic) نام را از
-                # `_remark_of(line)` می‌گیرند. vmess یگانه استثنا بود و
-                # مستقیم `ps`ِ درونی را می‌خواند. این استثنا یک نقصِ سنجیده‌شده
-                # تولید می‌کرد: اگر بدنهٔ base64 نویسهٔ بیرونِ الفبا داشته باشد،
-                # `core.decode_base64_text` (سخت‌گیر) شکست می‌خورد، پس
-                # `core.brand_remark` به شاخهٔ عمومی می‌افتد و فقط `#…` را
-                # بازنویسی می‌کند؛ `ps` کهنه می‌ماند و از همین‌جا **بی‌برند**
-                # به clash/sing-box می‌رفت. اندازه‌گیریِ زنده: ۱ نود از ۹٬۷۰۶
-                # با ریمارکِ «🇮🇳TM (@AZARBAYJAB1)» — یعنی تبلیغِ کانالِ رقیب.
-                # (همان کلاسِ حادثه‌ای که کامنتِ `core.brand_remark` ثبت کرده.)
-                #
-                # چرا `ps` را مثلِ ssr کنار نمی‌گذاریم: سنجیده شد که ۲٬۹۸۰ نودِ
-                # واقعی نامِ برندشده و حاملِ برچسبِ کشورشان را از `ps` می‌گیرند
-                # (fragment ندارند). حذفِ `ps` آن‌ها را به «vmess | @Raydikalx»
-                # تنزل می‌داد. پس ترتیب است، نه جایگزینی: fragment ← ps ← name.
-                #
-                # `_remark_of` خودش `unquote().strip()` می‌کند، پس fragmentِ
-                # تهی/فقط‌فاصله به `ps` واگذار می‌شود و نام هرگز تهی نمی‌ماند.
-                "type": "vmess",
-                "name": (_remark_of(line)
-                         or str(obj.get("ps") or obj.get("name") or "")
-                         or _branded_fallback("vmess")),
-                "server": str(obj.get("add") or ""),
-                "port": _safe_int(obj.get("port")),
-                "uuid": str(obj.get("id") or ""),
-                "alterId": _safe_int(obj.get("aid"), 0),
-                "cipher": str(obj.get("scy") or "auto"),
-                "network": (str(obj.get("net") or "tcp") or "tcp").lower(),
-                "tls": str(obj.get("tls") or "").lower() in ("tls", "reality"),
-                # پیش از این این سه مسیر (vmess/vless/trojan) خام عبور می‌کردند و
-                # `_clean_sni` تنها بر hysteria2/tuic اعمال می‌شد. سنجشِ خروجیِ
-                # زنده ۴۳۱ مقدارِ نامِ‌میزبانِ ساختاراً بی‌اعتبار را در همان سه
-                # مسیر نشان داد. اکنون هر ورودیِ نامِ‌میزبان از یک دروازه می‌گذرد.
-                "sni": _clean_sni(obj.get("sni") or obj.get("host")),
-                "host": _clean_sni(obj.get("host")),
-                "path": str(obj.get("path") or ""),
-                # در vmess فیلد type برای grpc به‌عنوان serviceName استفاده می‌شود
-                # و path معمولاً حامل آن است. fp نیز در برخی تولیدکننده‌ها هست.
-                "servicename": str(obj.get("path") or "").lstrip("/"),
-                "fp": str(obj.get("fp") or "").lower(),
-                "reality": str(obj.get("tls") or "").lower() == "reality",
-                "mode": str(obj.get("mode") or ""),
-                "extra": str(obj.get("extra") or ""),
-            }
+            return _parse_vmess(line)
 
         parsed = urllib.parse.urlparse(line.split("#")[0])
-        q = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
+        query = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
         scheme = parsed.scheme.lower()
         name = _remark_of(line) or _branded_fallback(scheme)
 
         if scheme == "vless":
+            security = (query.get("security") or "").lower()
             return {
                 "type": "vless",
                 "name": name,
                 "server": parsed.hostname or "",
                 "port": _safe_int(parsed.port),
                 "uuid": urllib.parse.unquote(parsed.username or ""),
-                "network": (q.get("type") or "tcp").lower(),
-                "tls": (q.get("security") or "").lower() in ("tls", "reality"),
-                "reality": (q.get("security") or "").lower() == "reality",
-                "sni": _clean_sni(q.get("sni") or q.get("host")),
-                "host": _clean_sni(q.get("host")),
-                "path": q.get("path") or "",
-                "flow": q.get("flow") or "",
-                "pbk": q.get("pbk") or "",
-                "sid": q.get("sid") or "",
-                "fp": q.get("fp") or "",
-                "servicename": q.get("serviceName") or q.get("servicename") or "",
-                # پارامترهای XHTTP (استاندارد Xray 2025/2026)
-                "mode": q.get("mode") or "",
-                "extra": q.get("extra") or "",
+                "network": (query.get("type") or "tcp").lower(),
+                "tls": security in ("tls", "reality"),
+                "reality": security == "reality",
+                "sni": _clean_sni(query.get("sni") or query.get("host")),
+                "host": _clean_sni(query.get("host")),
+                "path": query.get("path") or "",
+                "flow": query.get("flow") or "",
+                "pbk": query.get("pbk") or "",
+                "sid": query.get("sid") or "",
+                "fp": query.get("fp") or "",
+                "servicename": (query.get("serviceName")
+                                or query.get("servicename") or ""),
+                # XHTTP parameters (Xray 2025/2026)
+                "mode": query.get("mode") or "",
+                "extra": query.get("extra") or "",
             }
 
         if scheme == "trojan":
@@ -785,231 +871,40 @@ def parse_proxy(line: str) -> Optional[Dict[str, Any]]:
                 "server": parsed.hostname or "",
                 "port": _safe_int(parsed.port),
                 "password": urllib.parse.unquote(parsed.username or ""),
-                "network": (q.get("type") or "tcp").lower(),
-                "sni": _clean_sni(q.get("sni") or q.get("host")),
-                "host": _clean_sni(q.get("host")),
-                "path": q.get("path") or "",
-                "tls": True,  # trojan همیشه TLS
-                "fp": q.get("fp") or "",
-                "servicename": q.get("serviceName") or q.get("servicename") or "",
-                "mode": q.get("mode") or "",
-                "extra": q.get("extra") or "",
+                "network": (query.get("type") or "tcp").lower(),
+                "sni": _clean_sni(query.get("sni") or query.get("host")),
+                "host": _clean_sni(query.get("host")),
+                "path": query.get("path") or "",
+                "tls": True,  # trojan is always TLS
+                "fp": query.get("fp") or "",
+                "servicename": (query.get("serviceName")
+                                or query.get("servicename") or ""),
+                "mode": query.get("mode") or "",
+                "extra": query.get("extra") or "",
             }
 
         if scheme in ("ss", "shadowsocks"):
-            # SIP002: ss://base64(method:pass)@host:port  یا  ss://method:pass@host:port
-            rest = line[len(scheme) + 3:].split("#")[0]
-            method = password = ""
-            host = ""
-            port = 0
-            if "@" in rest:
-                userinfo, hostpart = rest.rsplit("@", 1)
-                hostpart = hostpart.split("?")[0]
-                try:
-                    dec = base64.urlsafe_b64decode(userinfo + "==").decode("utf-8", errors="ignore")
-                    if ":" in dec:
-                        userinfo = dec
-                except Exception:
-                    pass
-                userinfo = urllib.parse.unquote(userinfo)
-                if ":" in userinfo:
-                    method, password = userinfo.split(":", 1)
-                h, _, p = hostpart.rpartition(":")
-                host, port = h, _safe_int(p)
-            else:
-                try:
-                    dec = base64.urlsafe_b64decode(rest + "==").decode("utf-8", errors="ignore")
-                    creds, _, hp = dec.rpartition("@")
-                    if ":" in creds:
-                        method, password = creds.split(":", 1)
-                    h, _, p = hp.rpartition(":")
-                    host, port = h, _safe_int(p)
-                except Exception:
-                    return None
-            if not host or not port:
-                return None
-            # اعتبارسنجی سخت‌گیرانه: cipher نامعتبر (مثلاً UUIDی که اشتباهی در
-            # جای method آمده) کل فایل Clash/Sing-box را برای کاربر می‌شکند.
-            ok = _sanitize_ss(method, password)
-            if not ok:
-                return None
-            method, password = ok
-            return {
-                "type": "shadowsocks",
-                "name": name,
-                "server": host,
-                "port": port,
-                "cipher": method,
-                "password": password,
-            }
-
+            return _parse_shadowsocks(line, scheme, name)
         if scheme == "ssr":
-            # ssr://base64( host:port:protocol:method:obfs:base64(password)
-            #              /?obfsparam=b64&protoparam=b64&remarks=b64&group=b64 )
-            #
-            # برخلافِ بقیهٔ schemeها اینجا `parsed`/`q` بی‌فایده‌اند: کلِ بدنه
-            # base64 است، پس مثلِ شاخهٔ ss دستی رمزگشایی می‌شود. جداکردن با «#»
-            # بی‌خطر است چون «#» در هیچ‌یک از دو الفبای base64 نیست.
-            body = line[len("ssr://"):].split("#", 1)[0]
-            raw = _ub64_text(body)
-            if raw is None:
-                return None
-            main, _sep, qs = raw.partition("/?")
-            parts = main.split(":")
-            if len(parts) != 6:
-                # شش بخش در مشخصهٔ ssr **الزامی** است. همین دروازه میزبانِ IPv6
-                # را هم رد می‌کند (چون «:» شمارش را می‌شکند) و این درست است:
-                # مشخصهٔ ssr هیچ شکلی برای IPv6 تعریف نکرده، پس چنین خطی در
-                # mihomo هم بی‌معناست.
-                return None
-            host, port_s, sproto, method, sobfs, pwd_b64 = parts
-            port = _safe_int(port_s)
-            password = _ub64_text(pwd_b64)
-            if password is None:
-                return None
-            if not host or not port:
-                return None
-            # بازهٔ پورت عمداً اینجا سنجیده **نمی‌شود**: صاحبِ آن قاعده
-            # `filters.is_invalid_port` است (همان اصلِ «یک قاعده، یک خانه» که
-            # در سرِ `filters.py` مستند شده) و تکرارش دو حقیقتِ واگرا می‌ساخت.
-            ok = _sanitize_ssr(method, password, sobfs, sproto)
-            if not ok:
-                return None
-            method, password, sobfs, sproto = ok
-            sq = {k: v[0] for k, v in urllib.parse.parse_qs(qs).items()}
-            # `remarks` درونیِ base64 عمداً برای نام به کار نمی‌رود: خطِ لوله
-            # پیش از ساختِ خروجی `core.brand_remark` را اعمال می‌کند
-            # (aggregate.py خط ۳۰۴ پیش از خط ۳۶۸)، پس در تولید همیشه «#»
-            # برندشده وجود دارد و `_remark_of` برنده است — خواندنِ remarks
-            # کدِ مرده می‌شد. رفتار با بقیهٔ شاخه‌ها هم یکسان می‌ماند.
-            #
-            # پارامترهای اختیاری: base64ِ خراب نباید کلِ کانفیگ را بیندازد،
-            # ولی نباید خاموشانه به رشتهٔ تهی هم بدل شود که کاربر گمان کند
-            # مخفی‌سازی فعال است — پس «تهی» می‌شود و در YAML اصلاً نوشته نمی‌شود.
-            return {
-                "type": "shadowsocksr",
-                "name": name,
-                "server": host,
-                "port": port,
-                "cipher": method,
-                "password": password,
-                "obfs": sobfs,
-                "protocol": sproto,
-                "obfs_param":
-                    _ub64_text(sq.get("obfsparam"), allow_empty=True) or "",
-                "protocol_param":
-                    _ub64_text(sq.get("protoparam"), allow_empty=True) or "",
-            }
-
+            return _parse_ssr(line, name)
         if scheme in ("hysteria2", "hy2"):
-            # hysteria2://password@host:port/?sni=..&insecure=1&obfs=salamander
-            #            &obfs-password=..&alpn=h3
-            #
-            # هر دو schemeی بالا در ورودیِ واقعی دیده می‌شود (اندازه‌گیری:
-            # ۷۷ مورد با hysteria2:// و ۳ مورد با hy2://)، پس هر دو پذیرفته
-            # می‌شوند وگرنه سه کانفیگ خاموشانه گم می‌شد.
-            if not parsed.hostname or not parsed.port:
-                return None
-            # گذرواژه ممکن است در userinfo با یا بدونِ بخشِ کاربر بیاید
-            pwd = urllib.parse.unquote(parsed.username or "")
-            if parsed.password:
-                pwd = f"{pwd}:{urllib.parse.unquote(parsed.password)}" if pwd else \
-                    urllib.parse.unquote(parsed.password)
-            if not pwd:
-                return None
-            obfs = (q.get("obfs") or "").strip().lower()
-            # فقط salamander در hysteria2 استاندارد است؛ مقدارِ ناشناخته را
-            # نادیده می‌گیریم تا کلاینت کلِ فایل را رد نکند.
-            if obfs and obfs != "salamander":
-                obfs = ""
-            return {
-                "type": "hysteria2",
-                "name": name,
-                "server": parsed.hostname,
-                "port": _safe_int(parsed.port),
-                "password": pwd,
-                "sni": _clean_sni(q.get("sni") or q.get("peer")),
-                "insecure": _truthy(q.get("insecure") or q.get("allowInsecure")
-                                    or q.get("allow_insecure")),
-                "obfs": obfs,
-                "obfs_password": urllib.parse.unquote(
-                    q.get("obfs-password") or q.get("obfs_password") or ""),
-                "alpn": _alpn_list(q.get("alpn")),
-                "tls": True,          # hysteria2 همیشه روی QUIC/TLS است
-            }
-
+            return _parse_hysteria2(parsed, query, name)
         if scheme == "tuic":
-            # tuic://uuid:password@host:port/?congestion_control=cubic
-            #       &udp_relay_mode=native&sni=..&alpn=h3&allow_insecure=1
-            if not parsed.hostname or not parsed.port:
-                return None
-            uuid = urllib.parse.unquote(parsed.username or "")
-            pwd = urllib.parse.unquote(parsed.password or "")
-            if not uuid or not pwd:
-                return None
-            cc = (q.get("congestion_control") or q.get("congestion-control")
-                  or q.get("congestion") or "cubic").strip().lower()
-            if cc not in _TUIC_CONGESTION:
-                cc = "cubic"
-            urm = (q.get("udp_relay_mode") or q.get("udp-relay-mode")
-                   or "native").strip().lower()
-            if urm not in ("native", "quic"):
-                urm = "native"
-            return {
-                "type": "tuic",
-                "name": name,
-                "server": parsed.hostname,
-                "port": _safe_int(parsed.port),
-                "uuid": uuid,
-                "password": pwd,
-                "congestion_control": cc,
-                "udp_relay_mode": urm,
-                "sni": _clean_sni(q.get("sni")),
-                "insecure": _truthy(q.get("allow_insecure") or q.get("insecure")
-                                    or q.get("allowInsecure")),
-                "alpn": _alpn_list(q.get("alpn")),
-                "tls": True,          # tuic همیشه روی QUIC/TLS است
-            }
-    except Exception:
+            return _parse_tuic(parsed, query, name)
+    except Exception:  # noqa: BLE001
         return None
     return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# نرمال‌سازی transport
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+# REALITY
+# --------------------------------------------------------------------------- #
 
-#: نگاشت نام transport در URI به نام مورد انتظار mihomo.
-#: «raw»/«tcp» نام‌های یکسانی برای حالت بدون transport هستند (Xray از 25.x
-#: نام tcp را به raw تغییر داد). mihomo برای شبکهٔ ناشناخته به‌صورت خاموش به
-#: TCP برمی‌گردد، پس نرمال‌سازی صریح لازم است تا داده گم نشود.
-_CLASH_NETWORK_MAP: Dict[str, str] = {
-    "tcp": "tcp", "raw": "tcp", "": "tcp", "none": "tcp",
-    "ws": "ws", "websocket": "ws",
-    "httpupgrade": "ws",       # mihomo آن را با ws + v2ray-http-upgrade می‌سازد
-    "grpc": "grpc", "gun": "grpc",
-    "xhttp": "xhttp", "splithttp": "xhttp",
-    "h2": "h2", "http": "http",
-    "kcp": "tcp", "mkcp": "tcp",   # mihomo از kcp پشتیبانی نمی‌کند → TCP
-    "quic": "tcp",                 # پشتیبانی نمی‌شود → TCP
-}
+def _reality_params(p: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """Valid ``(pbk, sid)`` for REALITY, or None.
 
-#: transport‌هایی که sing-box 1.13 واقعاً می‌شناسد (با تست تأیید شده).
-#: xhttp در sing-box **وجود ندارد** → کانفیگ باید drop شود، نه اینکه بی‌سروصدا
-#: به TCP تبدیل شود (که وصل نمی‌شود و کاربر فکر می‌کند سرور خراب است).
-_SINGBOX_TRANSPORTS: frozenset = frozenset({"ws", "grpc", "http", "httpupgrade", "quic"})
-
-
-def _clash_network(raw: str) -> str:
-    return _CLASH_NETWORK_MAP.get((raw or "").lower(), "tcp")
-
-
-def _reality_params(p: Dict[str, Any]) -> Optional[tuple]:
-    """(pbk, sid) معتبر برای REALITY یا None.
-
-    None در دو حالت: (الف) این کانفیگ اصلاً reality نیست → صدازننده باید بی‌خیال
-    reality شود؛ (ب) مقادیر خراب‌اند → صدازننده باید کل کانفیگ را drop کند.
-    برای تفکیک این دو، از کلید 'reality' استفاده می‌شود.
+    None in two cases: this config is not reality at all, or its values are
+    corrupt. Use :func:`_reality_broken` to tell them apart.
     """
     if not p.get("reality"):
         return None
@@ -1022,11 +917,76 @@ def _reality_params(p: Dict[str, Any]) -> Optional[tuple]:
     return pbk, sid
 
 
-def _clash_transport_opts(p: Dict[str, Any], out: Dict[str, Any]) -> None:
-    """گزینه‌های transport را به دیکشنری پروکسی Clash اضافه می‌کند.
+def _reality_broken(p: Dict[str, Any]) -> bool:
+    """Whether the config declares REALITY but its parameters are unusable.
 
-    اسکیمای هر بخش از ساختارهای واقعی mihomo v1.19 استخراج شده است
-    (adapter/outbound/vless.go: WSOptions / GrpcOptions / XHTTPOptions / HTTP2Options).
+    Such a config must be dropped, for both targets and for every protocol.
+
+    This used to be checked only on the sing-box vless branch. parse_proxy also
+    sets ``reality: True`` for a vmess link whose tls field is "reality", and that
+    path reached _singbox_tls(), where ``reality = rp is not None`` quietly became
+    False. The emitted outbound then had plain TLS and no reality block: it loads,
+    so the file is accepted, and it never connects. _to_clash_proxy() had the same
+    gap. That is exactly the failure the module's golden rule forbids.
+    """
+    return bool(p.get("reality")) and _reality_params(p) is None
+
+
+# --------------------------------------------------------------------------- #
+# Transport normalisation
+# --------------------------------------------------------------------------- #
+
+#: URI transport name -> the name mihomo expects. "raw" and "tcp" are the same
+#: thing (Xray renamed tcp to raw in 25.x). mihomo silently falls back to TCP for
+#: an unknown network, so explicit normalisation is needed or data is lost.
+_CLASH_NETWORK_MAP: Dict[str, str] = {
+    "tcp": "tcp", "raw": "tcp", "": "tcp", "none": "tcp",
+    "ws": "ws", "websocket": "ws",
+    "httpupgrade": "ws",  # mihomo builds this as ws + v2ray-http-upgrade
+    "grpc": "grpc", "gun": "grpc",
+    "xhttp": "xhttp", "splithttp": "xhttp",
+    "h2": "h2", "http": "http",
+    "kcp": "tcp", "mkcp": "tcp",  # unsupported by mihomo -> TCP
+    "quic": "tcp",                # unsupported -> TCP
+}
+
+#: Transports sing-box 1.13 actually knows, verified by running it. xhttp does
+#: *not* exist there, so such a config must be dropped rather than silently
+#: downgraded to TCP, which would never connect while looking fine.
+_SINGBOX_TRANSPORTS: frozenset = frozenset(
+    {"ws", "grpc", "http", "httpupgrade", "quic"})
+
+
+class _Unsupported:
+    """Sentinel: this transport cannot be expressed for the target at all.
+
+    A distinct type rather than ``False``, which the old code returned from a
+    function annotated ``Optional[Dict]``. It only worked because the one caller
+    compared with ``is False``; any ``if not transport`` would have merged
+    "unsupported" with "no transport needed" and silently downgraded xhttp to TCP.
+    """
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:  # pragma: no cover - guard against truthiness use
+        raise TypeError("UNSUPPORTED must be compared with `is`, not truth-tested")
+
+
+UNSUPPORTED = _Unsupported()
+
+TransportResult = Union[Dict[str, Any], None, _Unsupported]
+
+
+def _clash_network(raw: str) -> str:
+    return _CLASH_NETWORK_MAP.get((raw or "").lower(), "tcp")
+
+
+def _clash_transport_opts(p: Dict[str, Any], out: Dict[str, Any]) -> None:
+    """Add transport options to a Clash proxy dict.
+
+    Each schema is taken from real mihomo v1.19 structs
+    (adapter/outbound/vless.go: WSOptions / GrpcOptions / XHTTPOptions /
+    HTTP2Options).
     """
     raw = (p.get("network") or "").lower()
     net = _clash_network(raw)
@@ -1035,68 +995,112 @@ def _clash_transport_opts(p: Dict[str, Any], out: Dict[str, Any]) -> None:
     out["network"] = net
 
     if net == "ws":
-        ws: Dict[str, Any] = {"path": path}
+        options: Dict[str, Any] = {"path": path}
         if host:
-            ws["headers"] = {"Host": host}
-        if raw in ("httpupgrade",):
-            # httpupgrade در mihomo یک شبکهٔ جدا نیست؛ ws با این پرچم است.
-            ws["v2ray-http-upgrade"] = True
-            ws["v2ray-http-upgrade-fast-open"] = True
-        out["ws-opts"] = ws
+            options["headers"] = {"Host": host}
+        if raw == "httpupgrade":
+            # httpupgrade is not a separate network in mihomo, it is ws + a flag.
+            options["v2ray-http-upgrade"] = True
+            options["v2ray-http-upgrade-fast-open"] = True
+        out["ws-opts"] = options
     elif net == "grpc":
-        # serviceName ممکن است در پارامتر serviceName یا در path آمده باشد.
-        svc = p.get("servicename") or (p.get("path") or "").lstrip("/")
-        out["grpc-opts"] = {"grpc-service-name": svc}
+        service = p.get("servicename") or (p.get("path") or "").lstrip("/")
+        out["grpc-opts"] = {"grpc-service-name": service}
     elif net == "xhttp":
-        xh: Dict[str, Any] = {"path": path}
+        options = {"path": path}
         if host:
-            xh["host"] = host
+            options["host"] = host
         if p.get("mode"):
-            xh["mode"] = p["mode"]
+            options["mode"] = p["mode"]
         if p.get("extra"):
-            # extra یک JSON خام از سمت Xray است؛ فقط کلیدهای شناخته‌شده را برمی‌داریم.
+            # `extra` is raw JSON from Xray; only known keys are lifted out.
             try:
-                ex = json.loads(p["extra"])
-                if isinstance(ex, dict):
-                    if isinstance(ex.get("xPaddingBytes"), (str, int)):
-                        xh["x-padding-bytes"] = str(ex["xPaddingBytes"])
-                    if isinstance(ex.get("noGRPCHeader"), bool):
-                        xh["no-grpc-header"] = ex["noGRPCHeader"]
-            except Exception:
+                extra = json.loads(p["extra"])
+                if isinstance(extra, dict):
+                    if isinstance(extra.get("xPaddingBytes"), (str, int)):
+                        options["x-padding-bytes"] = str(extra["xPaddingBytes"])
+                    if isinstance(extra.get("noGRPCHeader"), bool):
+                        options["no-grpc-header"] = extra["noGRPCHeader"]
+            except Exception:  # noqa: BLE001
                 pass
-        out["xhttp-opts"] = xh
+        out["xhttp-opts"] = options
     elif net == "h2":
-        h2: Dict[str, Any] = {"path": path}
+        options = {"path": path}
         if host:
-            h2["host"] = [host]
-        out["h2-opts"] = h2
+            options["host"] = [host]
+        out["h2-opts"] = options
     elif net == "http":
-        ho: Dict[str, Any] = {"path": [path]}
+        options = {"path": [path]}
         if host:
-            ho["headers"] = {"Host": [host]}
-        out["http-opts"] = ho
-    # net == "tcp" → هیچ بخش transport لازم نیست
+            options["headers"] = {"Host": [host]}
+        out["http-opts"] = options
+    # net == "tcp" needs no transport section
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Clash / Mihomo YAML
-# ──────────────────────────────────────────────────────────────────────────────
+def _singbox_transport(p: Dict[str, Any]) -> TransportResult:
+    """sing-box transport section, None when none is needed, or UNSUPPORTED.
+
+    UNSUPPORTED means the config cannot be expressed in sing-box (e.g. xhttp,
+    unknown to 1.13) and must be dropped. Silently converting it to TCP gives the
+    user a config that never connects.
+    """
+    raw = (p.get("network") or "").lower()
+    host = p.get("host") or p.get("sni") or ""
+    path = p.get("path") or "/"
+
+    if raw in ("", "tcp", "raw", "none"):
+        return None
+    if raw in ("ws", "websocket"):
+        transport: Dict[str, Any] = {"type": "ws", "path": path}
+        if host:
+            transport["headers"] = {"Host": host}
+        return transport
+    if raw == "httpupgrade":
+        transport = {"type": "httpupgrade", "path": path}
+        if host:
+            transport["host"] = host
+        return transport
+    if raw in ("grpc", "gun"):
+        service = p.get("servicename") or (p.get("path") or "").lstrip("/")
+        return {"type": "grpc", "service_name": service}
+    if raw in ("h2", "http"):
+        transport = {"type": "http", "path": path}
+        if host:
+            transport["host"] = [host]
+        return transport
+    if raw == "quic":
+        return {"type": "quic"}
+    # xhttp / splithttp / kcp / mkcp are not supported by sing-box
+    return UNSUPPORTED
+
+
+# --------------------------------------------------------------------------- #
+# Clash / Mihomo proxies
+# --------------------------------------------------------------------------- #
 
 def _to_clash_proxy(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    t = p["type"]
-    base = {"name": p["name"], "server": p["server"], "port": p["port"]}
+    """Intermediate dict -> one Clash proxy entry, or None to drop it."""
+    kind = p["type"]
     if not p["server"] or not p["port"]:
         return None
+    # Declared REALITY with unusable parameters can never connect, for any
+    # protocol. See _reality_broken.
+    if _reality_broken(p):
+        return None
+
+    base = {"name": p["name"], "server": p["server"], "port": p["port"]}
     try:
-        if t == "vmess":
+        if kind == "vmess":
             out = {**base, "type": "vmess", "uuid": p["uuid"],
-                   "alterId": p.get("alterId", 0), "cipher": p.get("cipher", "auto"),
+                   "alterId": p.get("alterId", 0),
+                   "cipher": p.get("cipher", "auto"),
                    "udp": True, "tls": p["tls"]}
             if p["sni"]:
                 out["servername"] = p["sni"]
             _clash_transport_opts(p, out)
             return out
-        if t == "vless":
+
+        if kind == "vless":
             out = {**base, "type": "vless", "uuid": p["uuid"], "udp": True,
                    "tls": p["tls"]}
             flow = _sanitize_flow(p.get("flow", ""))
@@ -1104,122 +1108,314 @@ def _to_clash_proxy(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 out["flow"] = flow
             if p["sni"]:
                 out["servername"] = p["sni"]
-            if p.get("reality"):
-                rp = _reality_params(p)
-                if rp is None:
-                    return None    # REALITY خراب → کل فایل را می‌شکند
-                out["reality-opts"] = {"public-key": rp[0], "short-id": rp[1]}
-            # client-fingerprint فقط مخصوص reality نیست — برای هر TLS معتبر است
-            # و mihomo با آن ClientHello را شبیه مرورگر می‌کند (ضدسانسور).
-            fp = (p.get("fp") or "").lower()
-            if fp in UTLS_FINGERPRINTS:
-                out["client-fingerprint"] = fp
+            reality = _reality_params(p)
+            if reality is not None:
+                out["reality-opts"] = {"public-key": reality[0],
+                                       "short-id": reality[1]}
+            # client-fingerprint is not reality-only: it is valid for any TLS and
+            # makes mihomo mimic a browser ClientHello, which matters for
+            # censorship resistance.
+            fingerprint = (p.get("fp") or "").lower()
+            if fingerprint in UTLS_FINGERPRINTS:
+                out["client-fingerprint"] = fingerprint
             elif p.get("reality"):
                 out["client-fingerprint"] = DEFAULT_UTLS_FINGERPRINT
             _clash_transport_opts(p, out)
             return out
-        if t == "trojan":
-            out = {**base, "type": "trojan", "password": p["password"], "udp": True}
+
+        if kind == "trojan":
+            out = {**base, "type": "trojan", "password": p["password"],
+                   "udp": True}
             if p["sni"]:
                 out["sni"] = p["sni"]
-            fp = (p.get("fp") or "").lower()
-            if fp in UTLS_FINGERPRINTS:
-                out["client-fingerprint"] = fp
+            fingerprint = (p.get("fp") or "").lower()
+            if fingerprint in UTLS_FINGERPRINTS:
+                out["client-fingerprint"] = fingerprint
             _clash_transport_opts(p, out)
             return out
-        if t == "shadowsocks":
-            return {**base, "type": "ss", "cipher": p["cipher"], "password": p["password"], "udp": True}
-        if t == "shadowsocksr":
-            # ⛔ عامدانه بیان نمی‌شود — بازبینیِ ۲۰۲۶-۰۸-۰۲، با اجرای هستهٔ رسمیِ
-            # Hiddify. توضیحِ کامل در بالای همین فایل، بخشِ «ShadowsocksR».
-            # خلاصه: نوشتنِ یک نودِ ssr در clash.yaml، **کلِ** آن فایل را برای
-            # Hiddify از کار می‌انداخت (measured: all/heavy/light هر سه exit 1)
-            # در حالی که خودِ نودها از راهِ configs.txt به mihomo می‌رسند.
+
+        if kind == "shadowsocks":
+            return {**base, "type": "ss", "cipher": p["cipher"],
+                    "password": p["password"], "udp": True}
+
+        if kind == "shadowsocksr":
+            # Deliberately not expressed: one ssr node breaks the whole
+            # clash.yaml for Hiddify. See the ShadowsocksR note at the top.
             return None
-        if t == "hysteria2":
-            # نام‌گذاریِ کلیدها با mihomo v1.19.29 آزمون شد (rc=0).
+
+        if kind == "hysteria2":
+            # Key names verified against mihomo v1.19.29 (rc=0).
             out = {**base, "type": "hysteria2", "password": p["password"]}
             if p.get("sni"):
                 out["sni"] = p["sni"]
             if p.get("insecure"):
                 out["skip-cert-verify"] = True
-            if p.get("obfs"):
+            # obfs without a password is a no-op in mihomo, so both keys are
+            # written together or neither; otherwise the user believes
+            # obfuscation is on when it is not.
+            if p.get("obfs") and p.get("obfs_password"):
                 out["obfs"] = p["obfs"]
-                # obfs بدونِ گذرواژه در mihomo بی‌اثر است؛ اگر گذرواژه نبود
-                # کلِ obfs را نمی‌نویسیم تا کاربر گمان نکند مخفی‌سازی فعال است.
-                if p.get("obfs_password"):
-                    out["obfs-password"] = p["obfs_password"]
-                else:
-                    out.pop("obfs")
+                out["obfs-password"] = p["obfs_password"]
             if p.get("alpn"):
                 out["alpn"] = list(p["alpn"])
             return out
-        if t == "tuic":
-            out = {**base, "type": "tuic", "uuid": p["uuid"], "password": p["password"],
+
+        if kind == "tuic":
+            out = {**base, "type": "tuic", "uuid": p["uuid"],
+                   "password": p["password"],
                    "congestion-controller": p.get("congestion_control", "cubic"),
                    "udp-relay-mode": p.get("udp_relay_mode", "native")}
             if p.get("sni"):
                 out["sni"] = p["sni"]
             if p.get("insecure"):
                 out["skip-cert-verify"] = True
-            # tuic روی QUIC است و ALPN لازم دارد؛ اگر منبع آن را نگفت h3
-            # پیش‌فرضِ استاندارد است. بدونِ ALPN، دست‌دادن در بسیاری از سرورها
-            # شکست می‌خورد.
+            # tuic runs on QUIC and needs an ALPN; h3 is the standard default.
+            # Without one, the handshake fails against many servers.
             out["alpn"] = list(p["alpn"]) if p.get("alpn") else ["h3"]
             return out
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
     return None
 
 
-#: سقف تعداد پروکسی در فایل‌های Clash/Sing-box.
-#: سقف قبلی ۱۵۰۰ بود که ~۶۵٪ کانفیگ‌ها را دور می‌ریخت، در حالی که خروجی کامل
-#: (~۴٬۲۰۰ پروکسی) فقط ۱.۳–۱.۸ مگابایت است و هر دو کلاینت آن را بی‌مشکل
-#: بارگذاری می‌کنند (با sing-box 1.13.14 و mihomo 1.19.29 تست شد).
+# --------------------------------------------------------------------------- #
+# sing-box outbounds
+# --------------------------------------------------------------------------- #
+
+def _singbox_tls(p: Dict[str, Any]) -> Dict[str, Any]:
+    """sing-box tls section, guaranteeing uTLS whenever REALITY is present.
+
+    Critical: without uTLS, reality is a fatal error in sing-box and the *whole
+    file* is rejected, not just that outbound. Callers must already have dropped
+    configs where :func:`_reality_broken` is true, so reality here is either valid
+    or absent.
+    """
+    tls: Dict[str, Any] = {
+        "enabled": True,
+        "server_name": p.get("sni") or p["server"],
+    }
+    reality = _reality_params(p)
+    if reality is not None:
+        tls["reality"] = {"enabled": True, "public_key": reality[0],
+                          "short_id": reality[1]}
+    fingerprint = (p.get("fp") or "").lower()
+    if fingerprint not in UTLS_FINGERPRINTS:
+        # An unknown fingerprint gives "unknown uTLS fingerprint" and rejects the
+        # file, so either use a valid default (mandatory for reality) or omit it.
+        fingerprint = DEFAULT_UTLS_FINGERPRINT if reality is not None else ""
+    if fingerprint:
+        tls["utls"] = {"enabled": True, "fingerprint": fingerprint}
+    if p.get("alpn"):
+        tls["alpn"] = p["alpn"]
+    return tls
+
+
+def _quic_tls(p: Dict[str, Any], default_alpn: Optional[List[str]] = None) -> Dict[str, Any]:
+    """tls section for the QUIC-based protocols (hysteria2, tuic)."""
+    tls: Dict[str, Any] = {
+        "enabled": True,
+        "server_name": p.get("sni") or p["server"],
+        "insecure": bool(p.get("insecure")),
+    }
+    alpn = list(p["alpn"]) if p.get("alpn") else default_alpn
+    if alpn:
+        tls["alpn"] = alpn
+    return tls
+
+
+def _to_singbox_outbound(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Intermediate dict -> one sing-box outbound, or None to drop it."""
+    kind = p["type"]
+
+    # Deliberate, documented rejection of ShadowsocksR. Not a defect, do not
+    # "fix" it. sing-box removed ssr in 1.6.0 and now registers a stub that
+    # errors with "ShadowsocksR is deprecated and removed in sing-box 1.6.0",
+    # rejecting the entire singbox.json and taking thousands of healthy proxies
+    # with it. The drop is recorded, not silent: the caller records
+    # not_expressible, so it appears in health.json.
+    if kind == "shadowsocksr":
+        return None
+    if not p["server"] or not p["port"]:
+        return None
+    if _reality_broken(p):
+        return None
+
+    try:
+        transport = _singbox_transport(p)
+        if transport is UNSUPPORTED:
+            return None  # drop rather than silently downgrade to TCP
+
+        if kind == "vmess":
+            outbound = {"type": "vmess", "tag": p["name"], "server": p["server"],
+                        "server_port": p["port"], "uuid": p["uuid"],
+                        "security": p.get("cipher", "auto"),
+                        "alter_id": p.get("alterId", 0)}
+            if p["tls"]:
+                outbound["tls"] = _singbox_tls(p)
+            if transport:
+                outbound["transport"] = transport
+            return outbound
+
+        if kind == "vless":
+            outbound = {"type": "vless", "tag": p["name"], "server": p["server"],
+                        "server_port": p["port"], "uuid": p["uuid"]}
+            flow = _sanitize_flow(p.get("flow", ""))
+            if flow:
+                outbound["flow"] = flow
+            if p["tls"]:
+                outbound["tls"] = _singbox_tls(p)
+            if transport:
+                outbound["transport"] = transport
+            return outbound
+
+        if kind == "trojan":
+            outbound = {"type": "trojan", "tag": p["name"],
+                        "server": p["server"], "server_port": p["port"],
+                        "password": p["password"], "tls": _singbox_tls(p)}
+            if transport:
+                outbound["transport"] = transport
+            return outbound
+
+        if kind == "shadowsocks":
+            return {"type": "shadowsocks", "tag": p["name"],
+                    "server": p["server"], "server_port": p["port"],
+                    "method": p["cipher"], "password": p["password"]}
+
+        if kind == "hysteria2":
+            # Verified against sing-box 1.13.14 (rc=0). Unlike Clash, obfuscation
+            # here is a nested object rather than two separate keys.
+            outbound = {"type": "hysteria2", "tag": p["name"],
+                        "server": p["server"], "server_port": p["port"],
+                        "password": p["password"], "tls": _quic_tls(p)}
+            if p.get("obfs") and p.get("obfs_password"):
+                outbound["obfs"] = {"type": p["obfs"],
+                                    "password": p["obfs_password"]}
+            return outbound
+
+        if kind == "tuic":
+            return {"type": "tuic", "tag": p["name"], "server": p["server"],
+                    "server_port": p["port"], "uuid": p["uuid"],
+                    "password": p["password"],
+                    "congestion_control": p.get("congestion_control", "cubic"),
+                    "udp_relay_mode": p.get("udp_relay_mode", "native"),
+                    "tls": _quic_tls(p, default_alpn=["h3"])}
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Shared preparation for both targets
+# --------------------------------------------------------------------------- #
+
+#: Proxy cap for the Clash/sing-box files. The old cap of 1,500 discarded ~65% of
+#: configs, while the full output (~4,200 proxies) is only 1.3-1.8 MB and both
+#: clients load it without trouble (verified with sing-box 1.13.14 and mihomo
+#: 1.19.29).
 OUTPUT_PROXY_LIMIT = 20000
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# باگ خاموشِ ناسازگاریِ YAML 1.1 (PyYAML) با YAML 1.2 (Go / mihomo)
-# ──────────────────────────────────────────────────────────────────────────────
-# PyYAML طرح‌وارهٔ YAML 1.1 را پیاده می‌کند و `9e63` را «عدد» نمی‌شناسد (چون در
-# ۱.۱ نماد علمی نیازمند نقطه است)، پس آن را **بدون کوتیشن** چاپ می‌کند.
-# اما `gopkg.in/yaml.v3` که mihomo استفاده می‌کند طرح‌وارهٔ YAML 1.2 است و
-# `9e63` را float ۹×۱۰⁶³ می‌خواند → مقدار به‌جای رشتهٔ hex، عدد می‌شود و
-# mihomo با «invalid REALITY short ID» **کل فایل** را رد می‌کند.
+def _prepare_nodes(lines: Iterable[str], target: str, limit: int,
+                   convert: Callable[[Dict[str, Any]], Optional[Dict[str, Any]]],
+                   name_key: str,
+                   reserved: Set[str]) -> List[Dict[str, Any]]:
+    """Parse, validate, convert, brand and uniquify nodes for one target.
+
+    Shared by both builders. They ran two near-identical loops before, which is
+    how a drop reason could be recorded for one target and forgotten for the other.
+
+    ``reserved`` seeds the used-name set with the group names. In Clash, groups and
+    nodes share one namespace, so a node that happens to match a group name breaks
+    the group reference: the client resolves to the node instead. sing-box has the
+    same property for outbound tags. Branding makes a collision impossible today,
+    but reserving moves correctness from luck to structure; on collision the loop
+    below appends " #n".
+
+    Order matters: brand first, then uniquify. The other way round, "... #1" could
+    land after the brand and break the legal name shape.
+    """
+    nodes: List[Dict[str, Any]] = []
+    used: Set[str] = set(reserved)
+    _drops.clear_target(target)
+
+    for line in lines:
+        if len(nodes) >= limit:
+            _drops.record(target, REASON_OVER_LIMIT, line)
+            continue
+        parsed = parse_proxy(line)
+        if not parsed:
+            _drops.record(target, REASON_UNPARSABLE, line)
+            continue
+        server = parsed.get("server")
+        # Two separate reasons on purpose: unroutable is about the IP
+        # *destination*, invalid_server about the *shape* of the value. Merging
+        # them blinds root-cause analysis.
+        if _is_unroutable_server(server):
+            _drops.record(target, REASON_UNROUTABLE, line, parsed.get("type"))
+            continue
+        if _is_structurally_invalid_server(server):
+            _drops.record(target, REASON_INVALID_SERVER, line, parsed.get("type"))
+            continue
+        node = convert(parsed)
+        if not node:
+            _drops.record(target, REASON_NOT_EXPRESSIBLE, line, parsed.get("type"))
+            continue
+
+        name = _enforce_brand(node[name_key], node["type"])
+        candidate = name
+        suffix = 1
+        while candidate in used:
+            candidate = f"{name} #{suffix}"
+            suffix += 1
+        node[name_key] = candidate
+        used.add(candidate)
+        nodes.append(node)
+    return nodes
+
+
+# --------------------------------------------------------------------------- #
+# Clash / Mihomo YAML
 #
-# همین تله برای هر رشتهٔ دیگری هم هست: short-id، رمزِ فقط-عددی مثل `123456`
-# (Go آن را int می‌خواند → خطای نوع)، UUIDهای عجیب، `0x…`، `true`/`null`.
-# پس به‌جای وصلهٔ موردی، در سطحِ Dumper هر رشته‌ای که در YAML 1.2 ممکن است
-# غیر-رشته تفسیر شود، اجباراً کوتیشن می‌شود.
+# PyYAML implements the YAML 1.1 schema and does not recognise `9e63` as a number
+# (1.1 requires a dot for scientific notation), so it emits it unquoted. But
+# gopkg.in/yaml.v3, which mihomo uses, is YAML 1.2 and reads `9e63` as the float
+# 9e63, turning a hex string into a number; mihomo then rejects the *whole file*
+# with "invalid REALITY short ID".
+#
+# The same trap applies to any string: short-ids, digit-only passwords like
+# `123456` (Go reads an int, then a type error), odd UUIDs, `0x...`, `true`,
+# `null`. So instead of patching one case, the Dumper force-quotes any string that
+# YAML 1.2 might read as a non-string.
+# --------------------------------------------------------------------------- #
+
 _YAML12_AMBIGUOUS = re.compile(
     r"""^(?:
-          [-+]?[0-9]+                                  # int ده‌دهی
-        | 0[oO][0-7]+ | 0[xX][0-9a-fA-F]+              # اکتال / هگز
-        | [-+]?(?:[0-9]+\.[0-9]*|\.[0-9]+|[0-9]+)      # float با/بدون نما
-              (?:[eE][-+]?[0-9]+)?
-        | [-+]?\.(?:inf|Inf|INF) | \.(?:nan|NaN|NAN)   # بی‌نهایت / NaN
-        | true|True|TRUE|false|False|FALSE             # بولین
-        | null|Null|NULL|~                             # تهی
+          [-+]?[0-9]+                                  # decimal int
+        | 0[oO][0-7]+ | 0[xX][0-9a-fA-F]+              # octal / hex
+        | [-+]?(?:[0-9]+\.[0-9]*|\.[0-9]+|[0-9]+)      # float, with or without
+              (?:[eE][-+]?[0-9]+)?                     #   an exponent
+        | [-+]?\.(?:inf|Inf|INF) | \.(?:nan|NaN|NAN)   # infinity / NaN
+        | true|True|TRUE|false|False|FALSE             # boolean
+        | null|Null|NULL|~                             # null
         )$""",
     re.VERBOSE,
 )
 
 
 def _yaml_str_representer(dumper, data):  # type: ignore[no-untyped-def]
-    """رشته‌های مبهم را با کوتیشن تک چاپ می‌کند تا Go آن‌ها را عدد نخواند."""
+    """Single-quote ambiguous strings so Go does not read them as numbers."""
     if data == "" or _YAML12_AMBIGUOUS.match(data):
         return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="'")
     return dumper.represent_scalar("tag:yaml.org,2002:str", data)
 
 
 def _clash_dumper():  # type: ignore[no-untyped-def]
-    """Dumper اختصاصی — بدون دست‌کاریِ حالتِ سراسریِ PyYAML.
+    """A dedicated Dumper, without mutating PyYAML's global state.
 
-    اگر libyaml موجود باشد از `CSafeDumper` استفاده می‌شود: در بنچمارکِ ۷٬۸۳۱
-    پروکسی، ۳.۹۹s ← ۰.۹۷s (حدود ۴ برابر سریع‌تر). چون خروجی سه بار (all/heavy/
-    light) تولید می‌شود، این تنها تغییر چند ثانیه از زمانِ هر اجرای CI می‌کاهد.
-    اگر libyaml نبود، بی‌صدا به پیاده‌سازیِ پایتونی برمی‌گردیم.
+    Uses CSafeDumper when libyaml is available: on a 7,831 proxy benchmark that is
+    3.99s -> 0.97s, about 4x. Output is generated three times per run
+    (all/heavy/light), so this alone saves several seconds of CI time. Falls back
+    to the pure-Python implementation silently.
     """
     import yaml
 
@@ -1233,56 +1429,14 @@ def _clash_dumper():  # type: ignore[no-untyped-def]
 
 
 def build_clash_yaml(lines: List[str], limit: int = OUTPUT_PROXY_LIMIT) -> str:
-    """لیست کانفیگ → رشتهٔ Clash YAML کامل (با proxy-groups)."""
+    """Config list -> a complete Clash YAML document, with proxy groups."""
     import yaml  # PyYAML
 
-    proxies: List[Dict[str, Any]] = []
-    # نامِ گروه‌ها **رزرو** می‌شود: در Clash فضای نامِ گروه و نودِ یکسان است، پس
-    # نودی که تصادفاً همنامِ یک گروه شود، ارجاعِ گروه را می‌شکند (کلاینت به نودِ
-    # همنام می‌رسد نه گروه). امروز با برندینگِ ۱۰۰٪ نامِ نود شکلِ
-    # «{کشور} | @Raydikalx | {TAG}» دارد و برخورد ممکن نیست؛ ولی رزروکردن،
-    # درستی را از «بختِ داده» به «ساختارِ کد» منتقل می‌کند. در صورتِ برخورد،
-    # حلقهٔ یکتاسازیِ پایین به‌طور طبیعی پسوندِ « #n» می‌زند.
-    used_names: set = {GROUP_MAIN, GROUP_AUTO, GROUP_FALLBACK}
-    _drops.clear_target("clash")
-    for line in lines:
-        if len(proxies) >= limit:
-            _drops.record("clash", "over_limit", line)
-            continue
-        p = parse_proxy(line)
-        if not p:
-            _drops.record("clash", "unparsable", line)
-            continue
-        # سرورِ غیرقابلِ‌اتصال (loopback / 0.0.0.0 / …) در ریزه‌ی جداگانه شمرده
-        # می‌شود نه در not_expressible: علتِ حذف نقصِ داده‌ی بالادست است، نه
-        # محدودیتِ کلاینت؛ درهم‌ریختنِ این دو عدد، ریشه‌یابی را کور می‌کند.
-        if _is_unroutable_server(p.get("server")):
-            _drops.record("clash", "unroutable_server", line, p.get("type"))
-            continue
-        # نشانیِ سرور که ساختاراً نامِ میزبان نیست (URL کامل، متنِ تبلیغی،
-        # تک‌برچسب). ریزه‌ی جدا از unroutable_server چون آن دربارهٔ *مقصدِ* IP
-        # است و این دربارهٔ *شکلِ* مقدار — یکی‌کردنشان ریشه‌یابی را کور می‌کند.
-        if _is_structurally_invalid_server(p.get("server")):
-            _drops.record("clash", "invalid_server", line, p.get("type"))
-            continue
-        cp = _to_clash_proxy(p)
-        if not cp:
-            _drops.record("clash", "not_expressible", line, p.get("type"))
-            continue
-        # نام یکتا — و پیش از یکتاسازی، دروازهٔ برند (فاز C12، لایهٔ ۲).
-        # ترتیب مهم است: اول برند، بعد پسوندِ یکتاسازی. اگر برعکس بود،
-        # «… #1» می‌توانست پس از برند بیفتد و شکلِ نامِ قانونی را بشکند.
-        nm = _enforce_brand(cp["name"], cp["type"])
-        base_nm = nm
-        i = 1
-        while nm in used_names:
-            nm = f"{base_nm} #{i}"
-            i += 1
-        cp["name"] = nm
-        used_names.add(nm)
-        proxies.append(cp)
-
-    names = [p["name"] for p in proxies]
+    proxies = _prepare_nodes(
+        lines, "clash", limit, _to_clash_proxy, "name",
+        reserved={GROUP_MAIN, GROUP_AUTO, GROUP_FALLBACK},
+    )
+    names = [proxy["name"] for proxy in proxies]
     doc = {
         "port": 7890,
         "socks-port": 7891,
@@ -1302,227 +1456,33 @@ def build_clash_yaml(lines: List[str], limit: int = OUTPUT_PROXY_LIMIT) -> str:
         ],
         "rules": [f"MATCH,{GROUP_MAIN}"],
     }
-    header = f"# Clash subscription — generated by {BRAND} aggregator\n"
+    header = f"# Clash subscription - generated by {BRAND} aggregator\n"
     return header + yaml.dump(
         doc,
         Dumper=_clash_dumper(),
         allow_unicode=True,
         sort_keys=False,
         default_flow_style=False,
-        width=10 ** 6,   # هرگز خطِ بلند را نشکن؛ شکستنِ خط مقادیر base64 را خراب می‌کند
+        # Never wrap: wrapping corrupts long base64 values.
+        width=10 ** 6,
     )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Sing-box JSON
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+# sing-box JSON
+# --------------------------------------------------------------------------- #
 
-def _singbox_tls(p: Dict[str, Any]) -> Dict[str, Any]:
-    """بخش tls برای sing-box با تضمین حضور uTLS در صورت نیاز REALITY.
+def _singbox_document(tags: List[str],
+                      outbounds: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """A complete, ready-to-use document for the sing-box >= 1.12/1.13 schema.
 
-    نکتهٔ حیاتی: sing-box بدون uTLS برای reality خطای FATAL می‌دهد و
-    **کل فایل** را رد می‌کند — نه فقط همان outbound. پس هر outbound دارای
-    reality الزاماً باید utls داشته باشد.
+    Notable choices, all required by that schema:
+      - DNS in the new type/server form; the old `address` form is deprecated.
+      - route.default_domain_resolver, whose absence emits a deprecation warning.
+      - action-based route rules (sniff / hijack-dns) instead of outbound=block.
+      - real inbounds: tun for mobile/desktop plus mixed for a browser.
     """
-    tls: Dict[str, Any] = {"enabled": True, "server_name": p.get("sni") or p["server"]}
-    rp = _reality_params(p)
-    reality = rp is not None
-    if reality:
-        tls["reality"] = {"enabled": True, "public_key": rp[0], "short_id": rp[1]}
-    fp = (p.get("fp") or "").lower()
-    if fp not in UTLS_FINGERPRINTS:
-        # اثرانگشت ناشناخته → «unknown uTLS fingerprint» و رد کل فایل.
-        # پس یا مقدار پیش‌فرض معتبر می‌گذاریم (اجباری برای reality) یا رها می‌کنیم.
-        fp = DEFAULT_UTLS_FINGERPRINT if reality else ""
-    if fp:
-        tls["utls"] = {"enabled": True, "fingerprint": fp}
-    if p.get("alpn"):
-        tls["alpn"] = p["alpn"]
-    return tls
-
-
-def _singbox_transport(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """بخش transport برای sing-box، یا None اگر transport لازم نیست.
-
-    مقدار بازگشتی «False» یعنی این کانفیگ در sing-box **قابل بیان نیست** و
-    باید drop شود (مثل xhttp که sing-box 1.13 آن را نمی‌شناسد). تبدیل خاموش
-    آن به TCP باعث می‌شود کاربر کانفیگی بگیرد که هرگز وصل نمی‌شود.
-    """
-    raw = (p.get("network") or "").lower()
-    host = p.get("host") or p.get("sni") or ""
-    path = p.get("path") or "/"
-
-    if raw in ("", "tcp", "raw", "none"):
-        return None                      # بدون transport
-    if raw in ("ws", "websocket"):
-        tr: Dict[str, Any] = {"type": "ws", "path": path}
-        if host:
-            tr["headers"] = {"Host": host}
-        return tr
-    if raw == "httpupgrade":
-        tr = {"type": "httpupgrade", "path": path}
-        if host:
-            tr["host"] = host
-        return tr
-    if raw in ("grpc", "gun"):
-        svc = p.get("servicename") or (p.get("path") or "").lstrip("/")
-        return {"type": "grpc", "service_name": svc}
-    if raw in ("h2", "http"):
-        tr = {"type": "http", "path": path}
-        if host:
-            tr["host"] = [host]
-        return tr
-    if raw == "quic":
-        return {"type": "quic"}
-    # xhttp / splithttp / kcp / mkcp → sing-box پشتیبانی نمی‌کند
-    return False  # type: ignore[return-value]
-
-
-def _to_singbox_outbound(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    t = p["type"]
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # 🔒 ردِ **عامدانه و مستندِ** ShadowsocksR (فاز C11)
-    # ══════════════════════════════════════════════════════════════════════════
-    # این `return None` نقص نیست؛ تصمیمی سنجیده است و نباید «تعمیر» شود.
-    #
-    # sing-box در ۱.۶.۰ ssr را حذف کرد (صفحهٔ رسمیِ /deprecated/: «has never
-    # been enabled by default … it does not make sense to continue to maintain
-    # it»). در ۱.۱۳.۱۵ تنها `option/shadowsocksr.go` به‌عنوانِ ساختارِ باقی‌مانده
-    # هست و `include/registry.go` (خط ۱۴۸) درونِ
-    # `registerStubForRemovedOutbounds` یک stub ثبت می‌کند که می‌گوید:
-    #     E.New("ShadowsocksR is deprecated and removed in sing-box 1.6.0")
-    # یعنی نوشتنِ یک outboundِ shadowsocksr **کلِ singbox.json** را رد می‌کند و
-    # هزاران پروکسیِ سالمِ دیگر را هم با خودش می‌برد.
-    #
-    # چرا این نامتقارنی بی‌خطر است: `build_clash_yaml` و `build_singbox_json`
-    # دو حلقهٔ کاملاً مستقل روی همان `lines` هستند و هر کدام `parse_proxy` را
-    # جدا صدا می‌زنند، پس این `None` هیچ اثری بر فهرستِ Clash ندارد. همین الگو
-    # از پیش هم برای ۲۸۱ کانفیگ (transportهای غیرقابلِ‌بیان) برقرار بوده است.
-    #
-    # و حذف **ثبت** می‌شود نه خاموش: فراخواننده
-    # `_drops.record("singbox", "not_expressible", line, "shadowsocksr")`
-    # می‌زند، پس در health.json دیده می‌شود.
-    if t == "shadowsocksr":
-        return None
-
-    if not p["server"] or not p["port"]:
-        return None
-    try:
-        transport = _singbox_transport(p)
-        if transport is False:
-            return None   # transport غیرقابل‌بیان → drop (نه تبدیل خاموش به TCP)
-
-        if t == "vmess":
-            ob = {"type": "vmess", "tag": p["name"], "server": p["server"],
-                  "server_port": p["port"], "uuid": p["uuid"],
-                  "security": p.get("cipher", "auto"), "alter_id": p.get("alterId", 0)}
-            if p["tls"]:
-                ob["tls"] = _singbox_tls(p)
-            if transport:
-                ob["transport"] = transport
-            return ob
-        if t == "vless":
-            if p.get("reality") and _reality_params(p) is None:
-                return None    # REALITY خراب → کل فایل را می‌شکند
-            ob = {"type": "vless", "tag": p["name"], "server": p["server"],
-                  "server_port": p["port"], "uuid": p["uuid"]}
-            flow = _sanitize_flow(p.get("flow", ""))
-            if flow:
-                ob["flow"] = flow
-            if p["tls"]:
-                ob["tls"] = _singbox_tls(p)
-            if transport:
-                ob["transport"] = transport
-            return ob
-        if t == "trojan":
-            ob = {"type": "trojan", "tag": p["name"], "server": p["server"],
-                  "server_port": p["port"], "password": p["password"],
-                  "tls": _singbox_tls(p)}
-            if transport:
-                ob["transport"] = transport
-            return ob
-        if t == "shadowsocks":
-            return {"type": "shadowsocks", "tag": p["name"], "server": p["server"],
-                    "server_port": p["port"], "method": p["cipher"], "password": p["password"]}
-        if t == "hysteria2":
-            # ساختارِ زیر با sing-box 1.13.14 آزمون شد (rc=0). بر خلافِ Clash،
-            # در sing-box مخفی‌سازی یک شیء تودرتو است نه دو کلیدِ جدا.
-            ob = {"type": "hysteria2", "tag": p["name"], "server": p["server"],
-                  "server_port": p["port"], "password": p["password"],
-                  "tls": {"enabled": True,
-                          "server_name": p.get("sni") or p["server"],
-                          "insecure": bool(p.get("insecure"))}}
-            if p.get("alpn"):
-                ob["tls"]["alpn"] = list(p["alpn"])
-            if p.get("obfs") and p.get("obfs_password"):
-                ob["obfs"] = {"type": p["obfs"], "password": p["obfs_password"]}
-            return ob
-        if t == "tuic":
-            ob = {"type": "tuic", "tag": p["name"], "server": p["server"],
-                  "server_port": p["port"], "uuid": p["uuid"],
-                  "password": p["password"],
-                  "congestion_control": p.get("congestion_control", "cubic"),
-                  "udp_relay_mode": p.get("udp_relay_mode", "native"),
-                  "tls": {"enabled": True,
-                          "server_name": p.get("sni") or p["server"],
-                          "insecure": bool(p.get("insecure")),
-                          "alpn": list(p["alpn"]) if p.get("alpn") else ["h3"]}}
-            return ob
-    except Exception:
-        return None
-    return None
-
-
-def build_singbox_json(lines: List[str], limit: int = OUTPUT_PROXY_LIMIT) -> str:
-    """لیست کانفیگ → رشتهٔ Sing-box JSON کامل (با selector/urltest)."""
-    outbounds: List[Dict[str, Any]] = []
-    # همان استدلالِ `used_names` در Clash — در sing-box هم tagِ outbound و tagِ
-    # selector/urltest در یک فضای نام‌اند.
-    used_tags: set = {GROUP_MAIN, GROUP_AUTO}
-    _drops.clear_target("singbox")
-    for line in lines:
-        if len(outbounds) >= limit:
-            _drops.record("singbox", "over_limit", line)
-            continue
-        p = parse_proxy(line)
-        if not p:
-            _drops.record("singbox", "unparsable", line)
-            continue
-        if _is_unroutable_server(p.get("server")):
-            _drops.record("singbox", "unroutable_server", line, p.get("type"))
-            continue
-        if _is_structurally_invalid_server(p.get("server")):
-            _drops.record("singbox", "invalid_server", line, p.get("type"))
-            continue
-        ob = _to_singbox_outbound(p)
-        if not ob:
-            _drops.record("singbox", "not_expressible", line, p.get("type"))
-            continue
-        # دروازهٔ برند روی تگِ نهایی (فاز C12، لایهٔ ۲) — قرینهٔ clash.
-        tag = _enforce_brand(ob["tag"], ob["type"])
-        base_tag = tag
-        i = 1
-        while tag in used_tags:
-            tag = f"{base_tag} #{i}"
-            i += 1
-        ob["tag"] = tag
-        used_tags.add(tag)
-        outbounds.append(ob)
-
-    tags = [o["tag"] for o in outbounds]
-    if not tags:
-        # سند بدون هیچ outbound معتبر بی‌فایده است؛ selector/urltest خالی
-        # در sing-box خطا می‌دهد. پس صریحاً خالی برنمی‌گردانیم.
-        return json.dumps({"log": {"level": "info"}, "outbounds": [
-            {"type": "direct", "tag": "direct"}]}, ensure_ascii=False, indent=2)
-
-    # سند کامل و آمادهٔ استفاده مطابق اسکیمای sing-box ≥ 1.12/1.13:
-    #   • DNS با فرمت جدید (type/server) — فرمت قدیمی address deprecated است
-    #   • route.default_domain_resolver — نبودش هشدار deprecation می‌دهد
-    #   • action-based route rules (sniff / hijack-dns / reject) به‌جای outbound=block
-    #   • inbounds واقعی: tun برای موبایل/دسکتاپ + mixed برای مرورگر
-    doc = {
+    return {
         "log": {"level": "info", "timestamp": True},
         "dns": {
             "servers": [
@@ -1569,4 +1529,21 @@ def build_singbox_json(lines: List[str], limit: int = OUTPUT_PROXY_LIMIT) -> str
             "clash_api": {"external_controller": "127.0.0.1:9090"},
         },
     }
-    return json.dumps(doc, ensure_ascii=False, indent=2)
+
+
+def build_singbox_json(lines: List[str], limit: int = OUTPUT_PROXY_LIMIT) -> str:
+    """Config list -> a complete sing-box JSON document, with selector/urltest."""
+    outbounds = _prepare_nodes(
+        lines, "singbox", limit, _to_singbox_outbound, "tag",
+        reserved={GROUP_MAIN, GROUP_AUTO},
+    )
+    tags = [outbound["tag"] for outbound in outbounds]
+    if not tags:
+        # A document with no valid outbound is useless, and an empty
+        # selector/urltest is an error in sing-box, so return a minimal valid one.
+        return json.dumps(
+            {"log": {"level": "info"},
+             "outbounds": [{"type": "direct", "tag": "direct"}]},
+            ensure_ascii=False, indent=2)
+    return json.dumps(_singbox_document(tags, outbounds),
+                      ensure_ascii=False, indent=2)

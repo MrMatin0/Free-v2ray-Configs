@@ -1,65 +1,39 @@
 # -*- coding: utf-8 -*-
-"""
-sources.py — منابع کانفیگ رایگان.
+"""Free config subscription sources, grouped by expected quality.
 
-سه دسته (به ترتیب کیفیت نزولی):
+Tiers, best first:
+    LIGHT  pre-tested or curated feeds. Small, high connect rate.
+    HEAVY  bulk aggregators. Large and diverse, lower connect rate.
+    ALL    LIGHT + HEAVY, de-duplicated, original order preserved.
 
-  • LIGHT  — منابعی که **خودشان** کانفیگ‌ها را تست کرده‌اند یا دستچین‌شده‌اند.
-             حجم کم، نرخ اتصال بالا. مناسب کاربری که فقط می‌خواهد «وصل شود».
-  • HEAVY  — تجمیع‌کننده‌های انبوه. حجم بالا، تنوع زیاد، نرخ اتصال پایین‌تر.
-  • ALL    — LIGHT + HEAVY بدون URL تکراری.
-
-قاعدهٔ نگهداری این فایل
-───────────────────────
-هر URL پیش از افزودن **باید** با درخواست واقعی HTTP بررسی شود و تعداد
-کانفیگ معتبرش شمرده شود. منبعی که چند دور پیاپی صفر کانفیگ برگرداند
-باید حذف شود، نه اینکه در لیست بماند و هر ۵ دقیقه بودجهٔ شبکه بسوزاند.
-وضعیت زندهٔ همهٔ منابع در `health.json` منتشر می‌شود.
-
-⚠️ نقطهٔ کورِ **سنجیده‌شدهٔ** قاعدهٔ بالا، و پاسخِ فاز D
-────────────────────────────────────────────────────────
-معیارِ «صفر کانفیگ» افزونگی را نمی‌بیند. اندازه‌گیریِ زنده (۳۰ جولای ۲۰۲۶):
-`mahdibland/Eternity.txt` با ۱۹۸ کانفیگ و `status: ok`، **زیرمجموعهٔ محضِ
-۱۰۰.۰۰٪** از `mahdibland/sub/sub_merge.txt` است — هر دو از یک مخزنِ بالادست.
-پس بازدهِ یکتایش صفر است ولی این قاعده هرگز رویش نمی‌افتد. همچنین
-`barry-far/All_Configs_base64_Sub.txt` و `Epodonios/All_Configs_Sub.txt`
-شباهتِ Jaccard = **۹۸.۳۳٪** دارند، و ۹ منبعِ `V2RAYCONFIGSPOOL` جمعاً فقط
-**۵۶** کانفیگِ یکتا از **۸٬۰۴۳** (۰.۷٪) می‌دهند.
-
-از این‌رو `state.py` سنجهٔ درست را دور به دور به یاد می‌آورد: **بازدهِ یکتا**،
-نه «تعدادِ کانفیگ» و نه «HTTP 200». تصمیمِ حذف هم دیگر دستی نیست
-(`disable_candidates()` با چهار شرطِ ایمنی).
-
-⚠️ این عددِ زیر **دستی** نگه‌داشته می‌شود و قبلاً دریفت کرده بود (می‌گفت «۱۸»
-در حالی که ۲۱ منبع در لیست بود). حالا تستِ
-`test_source_docstring_count_matches_the_actual_list` آن را قفل می‌کند، پس هر
-افزودن/حذفِ منبع باید همین جمله را هم به‌روز کند.
-
-آخرین اعتبارسنجی همهٔ URLهای زیر: ۳۰ جولای ۲۰۲۶ (هر ۲۱ منبع HTTP 200 و
-تعداد کانفیگ > ۰ برگرداندند).
+Maintenance rules
+    * Verify a URL with a real HTTP request before adding it.
+    * Live per-source status is published to ``health.json``.
+    * Retirement is automatic, not manual: ``state.py`` tracks *unique* yield
+      per source. Raw config count and HTTP 200 both hide mirror feeds, e.g.
+      Eternity.txt is a strict subset of sub_merge.txt from the same upstream.
+    * Counts are derived from the lists below, never written by hand.
 """
 from __future__ import annotations
+
 from typing import List
 
-# ── سبک / با کیفیت (۷ منبع) ───────────────────────────────────────────────────
-# نکته: چهار آدرس mci/sub_2..4 و mtn/sub_2..4 که قبلاً اینجا بودند حذف شدند؛
-# همهٔ آن‌ها HTTP 200 با بدنهٔ صفر بایت برمی‌گرداندند (منبع مرده ولی نامرئی).
+#: Curated / self-tested feeds.
 LIGHT_SOURCES: List[str] = [
-    # کانفیگ‌های تست‌شده با سرعت‌سنجی واقعی (بالاترین کیفیت موجود در گیت‌هاب)
+    # Speed-tested aggregate, highest quality available on GitHub.
     "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/Eternity.txt",
-    # لیست تست‌شدهٔ NoMoreWalls
     "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list_raw.txt",
-    # جمع‌آور با اعتبارسنجی ساختاری
+    # Structurally validated fetcher.
     "https://raw.githubusercontent.com/4n0nymou3/multi-proxy-config-fetcher/refs/heads/main/configs/proxy_configs.txt",
-    # ماهسانت (فقط sub_1 زنده است)
+    # MahsaNet: only sub_1 is live, sub_2..4 answer 200 with an empty body.
     "https://raw.githubusercontent.com/mahsanet/MahsaFreeConfig/refs/heads/main/mci/sub_1.txt",
     "https://raw.githubusercontent.com/mahsanet/MahsaFreeConfig/refs/heads/main/mtn/sub_1.txt",
-    # منابع دستچین‌شدهٔ متوسط‌حجم
+    # Mid-size hand-picked lists.
     "https://raw.githubusercontent.com/ALIILAPRO/v2rayNG-Config/main/server.txt",
     "https://raw.githubusercontent.com/w1770946466/Auto_proxy/main/Long_term_subscription_num",
 ]
 
-# ── انبوه / حجم بالا (۱۴ منبع) ────────────────────────────────────────────────
+#: High-volume aggregators. Expect heavy overlap between them.
 HEAVY_SOURCES: List[str] = [
     "https://raw.githubusercontent.com/roosterkid/openproxylist/refs/heads/main/V2RAY_RAW.txt",
     "https://raw.githubusercontent.com/barry-far/V2ray-Config/refs/heads/main/All_Configs_base64_Sub.txt",
@@ -73,18 +47,32 @@ HEAVY_SOURCES: List[str] = [
     "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/V2RAY_SUB/refs/heads/main/v2ray_configs_no8.txt",
     "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/V2RAY_SUB/refs/heads/main/v2ray_configs_no9.txt",
     "https://raw.githubusercontent.com/ShadowException/VPN/refs/heads/main/configs/VPN-cat",
-    # جایگزین‌های منبع مردهٔ MahsaNetConfigTopic/xray_final.txt (HTTP 404):
+    # Replacements for the dead MahsaNetConfigTopic/xray_final.txt (HTTP 404).
     "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt",
     "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",
 ]
 
+#: Tier label -> URL list. Single place to add a tier.
+SOURCE_TIERS = {
+    "light": LIGHT_SOURCES,
+    "heavy": HEAVY_SOURCES,
+}
+
 
 def all_sources() -> List[str]:
-    """LIGHT + HEAVY بدون URL تکراری (ترتیب حفظ می‌شود)."""
-    seen = set()
-    out: List[str] = []
-    for url in LIGHT_SOURCES + HEAVY_SOURCES:
-        if url not in seen:
-            seen.add(url)
-            out.append(url)
-    return out
+    """LIGHT + HEAVY without duplicate URLs, first-seen order preserved."""
+    return list(dict.fromkeys(LIGHT_SOURCES + HEAVY_SOURCES))
+
+
+def tier_of(url: str) -> str:
+    """Tier a URL belongs to, or ``"unknown"`` if it is not registered here."""
+    for tier, urls in SOURCE_TIERS.items():
+        if url in urls:
+            return tier
+    return "unknown"
+
+
+#: Derived, so docs and tests can never disagree with the lists.
+LIGHT_COUNT: int = len(LIGHT_SOURCES)
+HEAVY_COUNT: int = len(HEAVY_SOURCES)
+SOURCE_COUNT: int = len(all_sources())
