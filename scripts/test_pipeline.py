@@ -340,21 +340,56 @@ def test_grpc_service_name_falls_back_to_path():
 
 def test_singbox_drops_transports_it_cannot_express():
     """sing-box 1.13 اصلاً transportِ xhttp ندارد. تنزل‌دادن به TCP یعنی دادنِ
-    کانفیگی که هرگز وصل نمی‌شود؛ پس باید **حذف** شود."""
-    assert converters._singbox_transport({"network": "xhttp"}) is False   # حذفِ نود
-    assert converters._singbox_transport({"network": "splithttp"}) is False
-    assert converters._singbox_transport({"network": "kcp"}) is False
-    assert converters._singbox_transport({"network": "tcp"}) is None      # بدون transport
-    assert converters._singbox_transport({"network": ""}) is None
+    کانفیگی که هرگز وصل نمی‌شود؛ پس باید **حذف** شود.
+
+    ریفکتور: `_singbox_transport` دیگر `False` برنمی‌گرداند، بلکه سنتینلِ
+    `converters.UNSUPPORTED` را می‌دهد. آن سنتینل عمداً truth-test را با
+    `TypeError` رد می‌کند، چون `if not transport` دو حالتِ کاملاً متفاوتِ
+    «قابلِ بیان نیست» و «transport لازم نیست» را یکی می‌کرد و xhttp را بی‌صدا
+    به TCP تنزل می‌داد. پس مقایسه باید **هویتی** باشد (`is`)، نه بولی.
+    """
+    unsupported = converters.UNSUPPORTED
+
+    # ۱) سنتینل باید هویتی مقایسه شود و truth-test را رد کند
+    try:
+        bool(unsupported)
+    except TypeError:
+        pass
+    else:                                         # pragma: no cover
+        raise AssertionError(
+            "UNSUPPORTED باید در truth-test خطا بدهد، وگرنه `if not transport` "
+            "دوباره «قابلِ بیان نیست» را با «transport لازم نیست» یکی می‌کند")
+
+    # ۲) آنچه sing-box نمی‌شناسد → حذفِ نود، نه تنزل
+    for net in ("xhttp", "splithttp", "kcp", "mkcp"):
+        assert converters._singbox_transport({"network": net}) is unsupported, net
+
+    # ۳) TCP/خالی → نودِ سالم، فقط بدونِ بخشِ transport
+    for net in ("tcp", "raw", "none", ""):
+        assert converters._singbox_transport({"network": net}) is None, net
+    assert converters._singbox_transport({}) is None
+
     ws = converters._singbox_transport({"network": "ws", "path": "/a", "host": "h"})
-    assert ws and ws["type"] == "ws"
+    assert ws is not unsupported and ws is not None
+    assert ws["type"] == "ws" and ws["headers"]["Host"] == "h"
     hu = converters._singbox_transport({"network": "httpupgrade", "path": "/a"})
-    assert hu and hu["type"] == "httpupgrade"    # sing-box این را جدا دارد
-    # هر تایپِ تولیدشده باید در فهرستِ مجازِ sing-box باشد
-    for net in ("ws", "websocket", "httpupgrade", "grpc", "gun", "h2", "http", "quic"):
+    assert hu is not unsupported and hu is not None
+    assert hu["type"] == "httpupgrade"    # sing-box این را جدا دارد
+
+    # ۴) هر تایپِ تولیدشده باید در فهرستِ مجازِ sing-box باشد
+    for net in ("ws", "websocket", "httpupgrade", "grpc", "gun", "h2", "http",
+                "quic"):
         tr = converters._singbox_transport({"network": net, "path": "/a"})
-        assert tr is not False and tr is not None
+        assert tr is not unsupported and tr is not None, net
         assert tr["type"] in converters._SINGBOX_TRANSPORTS, f"{net} → {tr['type']}"
+
+    # ۵) و در خطِ لولهٔ واقعی: نودِ xhttp باید بیفتد و **شمرده** شود
+    xhttp = ("vless://11111111-1111-1111-1111-111111111111@h1.example.com:443"
+             "?type=xhttp&security=tls&sni=h1.example.com#x")
+    doc = json.loads(converters.build_singbox_json([xhttp]))
+    assert all(o.get("type") != "vless" for o in doc["outbounds"]), doc["outbounds"]
+    st = converters.drop_stats()["singbox"]
+    assert st["by_reason"].get("not_expressible") == 1, st
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1250,26 +1285,63 @@ def test_state_json_is_published_and_never_gates_the_round():
 
 
 def test_source_docstring_count_matches_the_actual_list():
-    """عددِ منابع در docstringِ `sources.py` باید با خودِ لیست بخواند.
+    """شمارنده‌های `sources.py` باید با خودِ لیست‌ها بخوانند.
 
     چرا این تستِ به‌ظاهر بی‌اهمیت لازم است: قاعدهٔ نگهداریِ آن فایل **دستی**
     است و از قبل دریفت کرده بود — docstring می‌گفت «۱۸ منبع» در حالی که
     `LIGHT(7) + HEAVY(14) = 21` بود. یعنی مستنداتِ همان قاعده‌ای که قرار بود
-    منابعِ مرده را حذف کند، خودش ۳ منبع عقب افتاده بود. این تست دریفت را
-    غیرممکن می‌کند.
+    منابعِ مرده را حذف کند، خودش ۳ منبع عقب افتاده بود.
+
+    ریفکتور: عدد دیگر در متنِ docstring نوشته نمی‌شود، بلکه از خودِ لیست‌ها
+    مشتق می‌شود. پس سنجهٔ درست، برابریِ
+    `SOURCE_COUNT == len(all_sources()) == LIGHT_COUNT + HEAVY_COUNT` است،
+    به‌علاوهٔ اینکه هیچ عددِ دست‌نویسی به متن برنگشته باشد.
+
+    این آزمون هم‌زمان **مصرف‌کنندهٔ** آن مشتق‌ها و `tier_of` است: قاعدهٔ P6
+    می‌گوید نامِ سطحِ مادولِ صفرمصرف یا کدِ مرده است یا APIای که هیچ‌کس صدا
+    نمی‌زند، و هر دو بدهی‌اند. اینجا هر چهار نام سنجیده می‌شوند، نه فقط
+    نام‌برده.
     """
     import re as _re
+
+    all_urls = sources.all_sources()
+
+    # ── ۱) مشتق‌ها باید با لیست‌ها بخوانند ────────────────────────
+    assert sources.LIGHT_COUNT == len(sources.LIGHT_SOURCES), (
+        f"LIGHT_COUNT={sources.LIGHT_COUNT} ولی لیست "
+        f"{len(sources.LIGHT_SOURCES)} تا دارد")
+    assert sources.HEAVY_COUNT == len(sources.HEAVY_SOURCES), (
+        f"HEAVY_COUNT={sources.HEAVY_COUNT} ولی لیست "
+        f"{len(sources.HEAVY_SOURCES)} تا دارد")
+    assert sources.SOURCE_COUNT == len(all_urls), (
+        f"SOURCE_COUNT={sources.SOURCE_COUNT} ولی all_sources() "
+        f"{len(all_urls)} تا داد")
+    assert sources.SOURCE_COUNT == sources.LIGHT_COUNT + sources.HEAVY_COUNT, (
+        f"{sources.SOURCE_COUNT} != {sources.LIGHT_COUNT} + "
+        f"{sources.HEAVY_COUNT} ⇒ URLِ تکراری بینِ دو تیر هست")
+
+    # ضدِپوچی: فهرست‌ها نباید تهی باشند و all_sources() نباید تکراری بدهد
+    assert sources.LIGHT_COUNT > 0 and sources.HEAVY_COUNT > 0
+    assert len(set(all_urls)) == len(all_urls), "all_sources() تکراری برگرداند"
+    assert all_urls[:sources.LIGHT_COUNT] == list(sources.LIGHT_SOURCES), (
+        "ترتیبِ first-seen حفظ نشده ⇒ خروجی بینِ دورها جابه‌جا می‌شود")
+
+    # ── ۲) `tier_of` باید با همان لیست‌هایی بخواند که مشتق‌ها از آن آمده‌اند
+    assert set(sources.SOURCE_TIERS) == {"light", "heavy"}, sources.SOURCE_TIERS
+    for url in sources.LIGHT_SOURCES:
+        assert sources.tier_of(url) == "light", url
+    for url in sources.HEAVY_SOURCES:
+        assert sources.tier_of(url) == "heavy", url
+    assert sources.tier_of("https://example.invalid/not-registered.txt") == (
+        "unknown"), "URLِ ناشناس باید unknown بدهد، نه یکی از تیرها"
+
+    # ── ۳) و هیچ عددِ دست‌نویسِ منبع نباید به docstring برگشته باشد ─────────
     doc = sources.__doc__ or ""
-    fa = "۰۱۲۳۴۵۶۷۸۹"
-    m = _re.search(r"هر ([۰-۹]+) منبع", doc)
-    assert m, "جملهٔ «هر N منبع» در docstringِ sources.py پیدا نشد"
-    claimed = int("".join(str(fa.index(ch)) for ch in m.group(1)))
-    actual = len(sources.all_sources())
-    assert claimed == actual, (
-        f"docstring می‌گوید {claimed} منبع ولی لیست {actual} تا دارد ⇒ همان "
-        f"دریفتی که فاز D بستنش را لازم دانست، برگشته")
-    assert actual == len(sources.LIGHT_SOURCES) + len(sources.HEAVY_SOURCES), (
-        "all_sources() تعدادِ متفاوتی داد ⇒ URLِ تکراری در لیست هست")
+    drifted = _re.search(r"[0-9۰-۹]+ *(?:sources|source|منبع)", doc, _re.I)
+    assert drifted is None, (
+        f"عددِ دست‌نویسِ «{drifted.group(0) if drifted else ''}» به docstringِ "
+        f"sources.py برگشته ⇒ همان دریفتی که فاز D بستنش را لازم دانست. "
+        f"شمارش باید فقط مشتق باشد.")
 
 
 def test_remark_tag_is_content_derived_not_positional():
@@ -1983,29 +2055,64 @@ def test_invalid_server_gate_runs_in_both_emitters():
 
     درسِ سنجیده‌شدهٔ فاز H: `_clean_sni` نوشته شده بود ولی فقط به ۲ پروتکل از ۵
     وصل شده بود، و همین شکاف ۴۳۱ مقدارِ نامعتبر را منتشر کرد. پس «وجودِ تابع»
-    شاهدِ کافی نیست؛ باید *فراخوانی‌اش* در هر دو مسیر اثبات شود. اینجا با AST
-    بررسی می‌شود تا ذکرِ نام در توضیحات، تست را الکی سبز نکند.
+    شاهدِ کافی نیست؛ باید *اجرا شدنش* در هر دو مسیر اثبات شود.
+
+    ریفکتور: آن دو حلقهٔ تقریباً یکسان با `_prepare_nodes()` یکی شده‌اند —
+    دقیقاً برای بستنِ همین شکاف. پس سنجهٔ اصلی اینجا **رفتاری** است (خروجی و
+    `drop_stats()`ِ هر دو هدف) و یک بررسیِ AST هم اضافه می‌شود تا اگر روزی
+    کسی مسیرِ مشترک را دوباره کپی-پیست کرد، آزمون سرخ شود.
     """
     import ast
     import inspect
 
+    good = "trojan://pw@example.com:443?sni=example.com#ok"
+    bad_shape = "trojan://pw@masir_sefid:443?sni=example.com#advert"
+    bad_dest = "trojan://pw@127.0.0.53:443?sni=example.com#local-resolver"
+    lines = [good, bad_shape, bad_dest]
+
+    # ── ۱) رفتار: هر دو هدف باید *هر دو* دروازه را اجرا کنند ────────────
+    doc = yaml.safe_load(converters.build_clash_yaml(lines))
+    assert [p["server"] for p in doc["proxies"]] == ["example.com"], doc["proxies"]
+    clash = converters.drop_stats()["clash"]
+    assert clash["by_reason"].get("invalid_server") == 1, clash
+    assert clash["by_reason"].get("unroutable_server") == 1, clash
+
+    sb = json.loads(converters.build_singbox_json(lines))
+    sb_servers = [o["server"] for o in sb["outbounds"] if o.get("server")]
+    assert sb_servers == ["example.com"], sb["outbounds"]
+    singbox = converters.drop_stats()["singbox"]
+    assert singbox["by_reason"].get("invalid_server") == 1, singbox
+    assert singbox["by_reason"].get("unroutable_server") == 1, singbox
+
+    # دو ریزهٔ جدا، نه یک سبدِ درهم: درهم‌ریختنشان ریشه‌یابی را کور می‌کند
+    assert clash["total"] == 2 and singbox["total"] == 2, (clash, singbox)
+
+    # ── ۲) ساختار: مسیر باید واقعاً مشترک بمانَد ───────────────────
     tree = ast.parse(inspect.getsource(converters))
     wanted = {"build_clash_yaml", "build_singbox_json"}
     seen = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name in wanted:
-            calls = {
+            seen[node.name] = {
                 c.func.id
                 for c in ast.walk(node)
                 if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
             }
-            seen[node.name] = calls
     assert wanted <= set(seen), f"توابعِ تولید پیدا نشدند: {set(seen)}"
     for fn in wanted:
-        assert "_is_structurally_invalid_server" in seen[fn], \
-            f"{fn} دروازهٔ invalid_server را صدا نمی‌زند"
-        assert "_is_unroutable_server" in seen[fn], \
-            f"{fn} دروازهٔ unroutable_server را صدا نمی‌زند"
+        assert "_prepare_nodes" in seen[fn], (
+            f"{fn} از مسیرِ مشترکِ _prepare_nodes عبور نمی‌کند ⇒ همان دو حلقهٔ "
+            f"موازی که شکافِ H8 را ساخت برگشته است")
+
+    gate_calls = {
+        c.func.id
+        for c in ast.walk(ast.parse(inspect.getsource(converters._prepare_nodes)))
+        if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+    }
+    for name in ("_is_structurally_invalid_server", "_is_unroutable_server"):
+        assert name in gate_calls, (
+            f"_prepare_nodes دروازهٔ {name} را صدا نمی‌زند ⇒ مسیرِ مشترک هست "
+            f"ولی دروازه در آن نیست")
 
 
 def test_alpn_values_are_whitelisted():
@@ -2182,37 +2289,87 @@ def test_aggregator_warms_up_the_geo_cache_before_branding():
     """بدونِ گرم‌کردن، ۱۳۶۵ پرسشِ DNS سری اجرا می‌شود (اندازه‌گیری: >۱۰ دقیقه).
 
     با گرم‌کردنِ همروند: ۴٫۹ ثانیه.
+
+    ریفکتور: گرم‌کردن و برندینگ از بدنهٔ `process_category` به دو هلپرِ
+    `_warm_up_countries()` و `_brand_all()` منتقل شده‌اند، پس پیمایشِ AST
+    *داخلِ خودِ* `process_category` دیگر هیچ `warm_up`/`brand_remark`ی
+    نمی‌بیند و نسخهٔ نحویِ این آزمون بی‌گناه‌سوز شده بود.
+
+    سنجهٔ درست رفتاری است — و از پیمایشِ نحوی قوی‌تر هم هست: `aggregate.geo`
+    استاب می‌شود و `core.brand_remark` رَپ، بعد ترتیبِ *واقعیِ اجرا* سنجیده
+    می‌شود. این‌طور فرقی نمی‌کند کد در کدام هلپر نشسته باشد؛ فقط رفتار مهم
+    است. میزبان‌ها عمداً IPِ لخت‌اند تا خودِ آزمون هیچ DNSی نزند.
     """
-    import ast
-    import inspect
-    import textwrap
     import aggregate
 
-    # نکته: جست‌وجوی متنیِ ساده در اینجا *غلط* است. متنِ تابع یک بلوکِ توضیحِ
-    # چندخطی دارد که در آن واژهٔ `brand_remark` برای *توضیحِ* دلیلِ گرم‌کردن آمده،
-    # و آن توضیح بالاتر از خودِ فراخوانیِ `warm_up` است. پس `str.index` اولین
-    # تطبیقش کامنت می‌شود و آزمون بی‌گناه‌سوز می‌گردد. پیمایشِ AST فقط کدِ
-    # اجرایی را می‌بیند و کامنت‌ها در درختِ نحوی وجود ندارند.
-    tree = ast.parse(textwrap.dedent(inspect.getsource(aggregate.process_category)))
-    fn = tree.body[0]
+    lines = [
+        "vless://aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa@1.1.1.1:443?type=tcp",
+        "vless://bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb@2.2.2.2:443?type=tcp",
+        "vless://cccccccc-cccc-cccc-cccc-cccccccccccc@3.3.3.3:443?type=tcp",
+    ]
+    per_source, urls = {"u": list(lines)}, ["u"]
+    events: list = []
 
-    warm_lines = [
-        n.lineno for n in ast.walk(fn)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "warm_up"
-    ]
-    brand_lines = [
-        n.lineno for n in ast.walk(fn)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "brand_remark"
-    ]
-    assert warm_lines, "process_category must warm the geo cache in one concurrent pass"
-    assert brand_lines, "process_category must brand every line"
-    # ترتیب مهم است: گرم‌کردن باید *پیش از* حلقهٔ برندینگ باشد
-    assert min(warm_lines) < min(brand_lines), (
-        f"warm_up (line {min(warm_lines)}) must run before the branding loop "
-        f"(line {min(brand_lines)}), otherwise it is pointless"
-    )
+    class _StubGeo:
+        """کمینه‌ترین چیزی که `_warm_up_countries` از یک مادولِ geo می‌خواهد."""
+
+        def warm_up(self, hosts):
+            events.append(("warm_up", list(hosts)))
+
+    class _BoomGeo:
+        """گرم‌کردنِ شکسته — best effort باید بماند."""
+
+        def warm_up(self, hosts):
+            raise RuntimeError("mmdb missing")
+
+    original_geo = getattr(aggregate, "geo", None)
+    original_brand = core.brand_remark
+
+    def _spy_brand(line, idx=None):
+        events.append(("brand_remark", line))
+        return original_brand(line, idx)
+
+    core.reset_country_cache()
+    aggregate.geo = _StubGeo()
+    core.brand_remark = _spy_brand
+    try:
+        result = aggregate.process_category(per_source, urls, {})
+    finally:
+        core.brand_remark = original_brand
+        aggregate.geo = original_geo
+        core.reset_country_cache()
+
+    kinds = [name for name, _payload in events]
+    assert "warm_up" in kinds, (
+        "کشِ geo هرگز گرم نشد ⇒ هر خط یک رفت‌وبرگشتِ سریِ DNS می‌شود")
+    assert "brand_remark" in kinds, "هیچ خطی برند نشد ⇒ آزمون پوچ است"
+
+    # ۱) ترتیب مهم است: گرم‌کردن باید *پیش از* اولین برندینگ اجرا شود
+    assert kinds.index("warm_up") < kinds.index("brand_remark"), (
+        f"گرم‌کردن بعد از شروعِ حلقهٔ برندینگ اجرا شد ⇒ بی‌فایده است: {kinds}")
+
+    # ۲) یک پاسِ همروند، نه یکی به‌ازای هر خط — همان چیزی که >۱۰ دقیقه را به
+    #    ۴٫۹ ثانیه رساند
+    assert kinds.count("warm_up") == 1, (
+        f"warm_up {kinds.count('warm_up')} بار صدا شد ⇒ دیگر یک پاسِ همروند نیست")
+    warmed = events[kinds.index("warm_up")][1]
+    assert len(warmed) == len(lines), (
+        f"گرم‌کردن {len(warmed)} میزبان دید ولی {len(lines)} خط داشتیم ⇒ بخشی "
+        f"از خطوط هنوز داخلِ حلقهٔ برندینگ DNS می‌زنند")
+
+    # ۳) ضدِپوچی: خروجی باید واقعاً تولید و برند شده باشد
+    assert len(result.unique) == len(lines), result.unique
+    assert all(core.is_branded(x) for x in result.unique)
+
+    # ۴) و شکستِ geo هرگز نباید تجمیع را بشکند (مانیتورینگ است، نه محصول)
+    aggregate.geo = _BoomGeo()
+    try:
+        recovered = aggregate.process_category(per_source, urls, {})
+    finally:
+        aggregate.geo = original_geo
+        core.reset_country_cache()
+    assert len(recovered.unique) == len(lines), (
+        "شکستِ گرم‌کردنِ geo کلِ دسته را برد ⇒ مانیتورینگ نباید محصول را بشکند")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3467,19 +3624,89 @@ def test_realtest_never_lets_the_subprocess_inherit_stdin() -> None:
     لایهٔ دومِ دفاع در برابرِ قفل: حتی اگر بررسیِ ورودی روزی دور زده شود،
     فرزند نباید ورودیِ استاندارد را به ارث ببرد.
 
-    این تست به **کدِ اجرایی** نگاه می‌کند نه به مستندات، چون یک رشتهٔ درستِ
-    داخلِ توضیحات هیچ چیزی را تضمین نمی‌کند (درسِ بندِ B3: تستی که با یک
-    کامنت سبز می‌شود توخالی است).
+    ریفکتور: خودِ فراخوانیِ `subprocess.run` از `run_test` به هلپرِ `_execute()`
+    منتقل شده، پس `inspect.getsource(realtest.run_test)` دیگر آن رشته را ندارد و
+    نسخهٔ متنیِ این آزمون بی‌گناه‌سوز شده بود.
+
+    نسخهٔ تازه از تستِ متنی هم قوی‌تر است: `realtest.subprocess.run` پچ می‌شود و
+    *آرگومان‌های واقعیِ ارسال‌شده* سنجیده می‌شوند. یک رشتهٔ درستِ داخلِ
+    توضیحات دیگر نمی‌تواند این آزمون را سبز کند (درسِ بندِ B3).
     """
+    import ast as _ast
     import inspect as _inspect
-    import re as _re
-    src = _inspect.getsource(realtest.run_test)
-    code = "\n".join(ln for ln in src.splitlines()
-                     if not ln.strip().startswith("#"))
-    assert _re.search(r"stdin\s*=\s*subprocess\.DEVNULL", code), \
-        "run_test must pass stdin=subprocess.DEVNULL in real code"
-    assert _re.search(r"timeout\s*=\s*limit", code), \
-        "run_test must pass a hard timeout to subprocess.run"
+    import subprocess as _subprocess
+
+    captured: dict = {}
+
+    class _FakeCompleted:
+        returncode = 0
+        stdout = b"fake output"
+
+    def _fake_run(argv, **kwargs):
+        captured["argv"] = list(argv)
+        captured["kwargs"] = dict(kwargs)
+        return _FakeCompleted()
+
+    def _timeout_run(argv, **kwargs):
+        raise _subprocess.TimeoutExpired(cmd=list(argv), timeout=1)
+
+    original_run = realtest.subprocess.run
+    try:
+        # ── ۱) آرگومان‌های واقعیِ ارسال‌شده به فرزند ──────────────────
+        realtest.subprocess.run = _fake_run
+        output, elapsed = realtest._execute(["xray-knife", "http"], 321)
+
+        kwargs = captured.get("kwargs") or {}
+        assert captured.get("argv") == ["xray-knife", "http"], captured
+        assert kwargs.get("stdin") is _subprocess.DEVNULL, (
+            f"stdin=subprocess.DEVNULL پاس نشد ⇒ فرزند stdinِ بازِ CI را به ارث "
+            f"می‌برد و اجرا با rc=124 قفل می‌شود: {kwargs}")
+        assert kwargs.get("timeout") == 321, (
+            f"تایم‌اوتِ سختِ پایتون به subprocess.run نرسید: {kwargs}")
+        assert kwargs.get("check") is False, (
+            "check=True استثنایِ دیگری می‌دهد و پیامِ تشخیصیِ XrayKnifeFailed "
+            "گم می‌شود")
+        assert output == "fake output" and elapsed >= 0
+
+        # ── ۲) و تایم‌اوت باید ترجمه شود، نه خام بالا برود ──────────────
+        realtest.subprocess.run = _timeout_run
+        try:
+            realtest._execute(["xray-knife", "http"], 1)
+        except realtest.XrayKnifeFailed:
+            pass
+        except _subprocess.TimeoutExpired as exc:  # pragma: no cover
+            raise AssertionError(
+                f"TimeoutExpiredِ خام بالا رفت ⇒ لایهٔ اجرا باید آن را به "
+                f"XrayKnifeFailed ترجمه کند: {exc}") from exc
+        else:                                      # pragma: no cover
+            raise AssertionError("تایم‌اوت باید XrayKnifeFailed بدهد")
+    finally:
+        realtest.subprocess.run = original_run
+
+    # ── ۳) ضدِدورزدن: هیچ `subprocess.run`ی نباید بیرونِ `_execute` باشد ────
+    owners = []
+    for node in _ast.parse(_inspect.getsource(realtest)).body:
+        if not isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            continue
+        for call in _ast.walk(node):
+            if (isinstance(call, _ast.Call)
+                    and isinstance(call.func, _ast.Attribute)
+                    and call.func.attr == "run"
+                    and isinstance(call.func.value, _ast.Name)
+                    and call.func.value.id == "subprocess"):
+                owners.append(node.name)
+    assert owners == ["_execute"], (
+        f"subprocess.run باید تنها در _execute باشد تا هر سه دفاعِ ضدِقفل یک‌جا "
+        f"بمانند؛ پیدا شد در: {owners}")
+
+    # و `run_test` باید واقعاً از همان مسیر عبور کند
+    run_test_calls = {
+        c.func.id
+        for c in _ast.walk(_ast.parse(_inspect.getsource(realtest.run_test)))
+        if isinstance(c, _ast.Call) and isinstance(c.func, _ast.Name)
+    }
+    assert "_execute" in run_test_calls, (
+        "run_test از _execute عبور نمی‌کند ⇒ دفاعِ stdin دور زده شده است")
 
 
 def test_realtest_deletes_a_stale_output_before_running() -> None:
@@ -4295,8 +4522,14 @@ def test_pipeline_survives_a_missing_or_broken_health_file():
         assert warn_absent.strip(), "نبودنِ فایل باید هشدار بدهد، نه سکوت"
         assert warn_broken.strip(), "خرابیِ JSON باید هشدار بدهد، نه سکوت"
         assert warn_notdict.strip(), "نوعِ نادرست باید هشدار بدهد، نه سکوت"
-        assert "نیست" in warn_absent, (
+        # لاگِ هشدارها انگلیسی شده‌اند؛ سنجه همان **تفکیکِ تشخیصی** است، نه زبان:
+        # هر سه عیب باید از متنِ هشدار قابلِ تشخیص باشند.
+        assert "does not exist" in warn_absent, (
             f"هشدارِ «نبودنِ فایل» باید همین را بگوید: {warn_absent!r}")
+        assert "unreadable" in warn_broken, (
+            f"هشدارِ «JSONِ خراب» باید همین را بگوید: {warn_broken!r}")
+        assert "not a JSON object" in warn_notdict, (
+            f"هشدارِ «شیء نبودن» باید همین را بگوید: {warn_notdict!r}")
         assert warn_absent != warn_broken, (
             "هشدارِ «فایل نیست» و «فایل خراب است» یکی شده‌اند؛ "
             f"عیب‌یابی در CI کور می‌شود: {warn_absent!r}")
@@ -9262,7 +9495,9 @@ def test_zzz_hdr_aggregate_writes_headers_into_txt_b64_yaml_but_not_json():
         assert set(_hd_headers(txt)) >= set(core.HIDDIFY_HEADER_KEYS), _hd_headers(txt)
         assert txt.startswith("#profile-title:"), txt[:80]
         # سرآیندِ توضیحیِ قدیمی نباید حذف شده باشد (رگرسیون)
-        assert "# @Raydikalx — ALL — 3 unique configs" in txt
+        # خطِ تیرهٔ سرآیندِ توضیحی ASCII است (`-`)، نه em-dash (`—`):
+        # مقایسهٔ بایت‌به‌بایت باید با همان چیزی باشد که aggregate می‌نویسد.
+        assert "# @Raydikalx - ALL - 3 unique configs" in txt, txt[:400]
 
         raw_b64 = open(os.path.join(d, "all", "configs_base64.txt"), encoding="utf-8").read()
         assert "#" not in raw_b64, "سرآیند باید *درونِ* payload باشد، نه بیرونش"
@@ -12079,6 +12314,11 @@ def test_zzz_p6_no_module_level_name_in_scripts_has_zero_consumers():
          • core.HIDDIFY_HEADER_KEYS  (سنجهٔ سرصفحه، ۱۳ ارجاع)
          • sources.all_sources       (۳ ارجاع)
          • converters._SINGBOX_TRANSPORTS (۱ ارجاع)
+         • sources.LIGHT_COUNT / HEAVY_COUNT / SOURCE_COUNT و sources.tier_of
+           (مشتق‌های شمارش و برچسبِ تیر؛ مصرف‌شده در
+            test_source_docstring_count_matches_the_actual_list — عددِ منابع
+            دیگر در docstring دستی نوشته نمی‌شود، پس مصرف‌کنندهٔ آن
+            مشتق‌ها همین آزمون است)
        پس «ارجاع از آزمون هم ارجاع است». هزینه‌اش این است که اگر کسی نامِ
        مرده‌ای را فقط داخلِ همین فایل به‌صورت رشته بنویسد، این آزمون آن را
        نمی‌گیرد؛ درست به همین دلیل آزمونِ نقطه‌ایِ بالا جدا نگه داشته شده و
