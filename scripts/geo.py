@@ -1,67 +1,32 @@
-"""
-geo.py — تعیینِ کشورِ واقعیِ سرور از روی نشانیِ شبکه، نه از روی متنِ ریمارک.
+# -*- coding: utf-8 -*-
+"""Resolve a server's real country from its network address, not its remark text.
 
-چرا این ماژول ساخته شد
-──────────────────────
-برچسبِ کشور پیش از این تنها از متنِ ریمارکِ منبع خوانده می‌شد. آن روش سه مرحله
-داشت: پرچمِ داخلِ ریمارک، جست‌وجوی کلیدواژه، و در پایان حلقه‌ای که هر واژهٔ
-دوحرفیِ لاتین را کدِ کشور فرض می‌کرد. مرحلهٔ سوم یک حدس بود، نه یک اندازه‌گیری:
-«join-us-on-Telegram» کشور را US می‌ساخت و «剩余流量：55.26 GB» آن را GB.
+Why: the old label came from the remark string, and its last step assumed any
+two-letter Latin word was a country code. "join-us-on-Telegram" became US and
+"55.26 GB" became GB. Accuracy on a 675 config sample, ground truth from
+ip-api.com:
 
-اندازه‌گیریِ دقتِ روشِ قدیمی روی نمونه‌ای از ۶۷۵ کانفیگ که کشورِ واقعی‌شان از
-یک منبعِ مستقل (ip-api.com) گرفته شده بود:
+    old remark parsing   53.6% correct, 14.7% wrong, 31.7% gave up as "Global"
+    this module          97.9% correct,  2.1% wrong,  0.0% gave up
 
-    درست            ۳۶۲   (۵۳٫۶٪)
-    غلط              ۹۹   (۱۴٫۷٪)
-    «Global» (تسلیم) ۲۱۴   (۳۱٫۷٪)
+A wrong flag is worse than no flag: someone who sees "US" and lands in Canada
+is right to distrust every other number in the repo.
 
-یعنی از هر هفت کانفیگ، یکی برچسبِ کشورِ **اشتباه** می‌گرفت. برچسبِ اشتباه از
-نبودِ برچسب بدتر است: کاربری که «US 🇺🇸» می‌بیند و به سرورِ کانادایی وصل می‌شود
-حق دارد به همهٔ داده‌های مخزن بی‌اعتماد شود.
+Database: DB-IP Country Lite, CC-BY-4.0, monthly, no account key. Chosen over
+MaxMind GeoLite2, whose download has required an account key since 2019 (live
+check: DB-IP 200, MaxMind 401). The download itself happens in the workflow's
+"Download GeoIP database" step, which owns that URL; this module only reads the
+file at MMDB_PATH and degrades gracefully when it is absent.
 
-روشِ این ماژول روی همان نمونه:
+Label stability: 73.2% of hosts are IP literals, so their lookup is pure. The
+rest need DNS, which is not stable. Over two back-to-back runs on 1,127 named
+hosts, gethostbyname flipped the country for 25 hosts (2.22%) because it returns
+one rotating round-robin address; taking the full sorted A-record set and voting
+by majority flips 4 (0.35%). So the country is derived from the address *set*,
+which is independent of response order.
 
-    درست            ۶۶۱   (۹۷٫۹٪)
-    غلط              ۱۴   (۲٫۱٪)
-    «Global»          ۰   (۰٫۰٪)
-
-پایگاهِ داده
-────────────
-DB-IP Country Lite با پروانهٔ CC-BY-4.0، ماهانه به‌روز، بدونِ کلیدِ اشتراک.
-انتخابِ آگاهانه در برابرِ GeoLite2 مکس‌مایند: دانلودِ GeoLite2 از سالِ ۲۰۱۹ کلیدِ
-حساب می‌خواهد و در CI به رمزِ مخزن گره می‌خورد. آزمونِ زنده:
-
-    DB-IP    → HTTP 200
-    MaxMind  → HTTP 401
-
-پس DB-IP هم دقیق است هم بی‌قید؛ اگر روزی در دسترس نبود، ماژول به‌جای شکستن
-به حالتِ کاهش‌یافته می‌رود (پایینِ همین فایل).
-
-پایداریِ برچسب
-──────────────
-فازِ پیشین ثابت کرد خروجیِ ناپایدار هزینهٔ واقعی دارد: هر تغییرِ بی‌دلیل در
-ریمارک، کل فایل را از نو می‌نویسد. پس برچسبِ کشور هم باید بینِ دو اجرا یکسان
-بماند، وگرنه همان مشکل از راهِ دیگری برمی‌گردد.
-
-۷۳٫۲٪ از میزبان‌ها IP خام‌اند؛ برای آن‌ها پرسشِ پایگاهِ داده تابعِ خالص است و
-پایداری تضمین‌شده. برای ۲۶٫۸٪ باقی‌مانده DNS لازم است و DNS پایدار نیست.
-اندازه‌گیریِ دو اجرای پشت‌سرهم روی ۱۱۲۷ میزبانِ نامی:
-
-    gethostbyname (یک نشانی)      ۲۵ میزبان کشورشان عوض شد  (۲٫۲۲٪)
-    مجموعهٔ کاملِ رکوردهای A       ۴ میزبان                  (۰٫۳۵٪)
-
-علت: gethostbyname یکی از چند نشانیِ round-robin را برمی‌گرداند و انتخابش در
-هر فراخوانی عوض می‌شود. راهکار: getaddrinfo تمامِ رکوردهای A را می‌گیرد،
-مرتب می‌شود، و کشور با رأی‌گیریِ اکثریت از خودِ *مجموعه* گرفته می‌شود. مجموعه
-مستقل از ترتیبِ پاسخ است، پس برچسب پایدار می‌شود. تأثیرِ عملی: ۶۶ کانفیگِ
-ناپایدار به ۴ کانفیگ رسید (۰٫۸۲٪ → ۰٫۰۵٪).
-
-هزینه
-─────
-حل‌کردنِ ۱۳۶۵ میزبانِ نامی با ۶۴ رشتهٔ همروند ۴٫۹ ثانیه طول می‌کشد. اجرای فعلیِ
-خطِ لوله ۴٫۸ ثانیه است، پس بدترین حالت آن را دو برابر می‌کند و همچنان بسیار
-کمتر از فاصلهٔ ۱۵ دقیقه‌ایِ به‌روزرسانی است. ۶۰۷۶ کانفیگ (۷۵٫۸٪) هیچ DNS لازم
-ندارند و بی‌درنگ برچسب می‌خورند.
+Cost: 1,365 named hosts at 64 threads is ~4.9s, against a 15 minute refresh
+interval. 75.8% of configs need no DNS at all.
 """
 
 from __future__ import annotations
@@ -72,118 +37,79 @@ import os
 import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Iterable, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-#: مسیرِ پایگاهِ داده. CI آن را دانلود و در همین مسیر cache می‌کند.
+#: Database path. CI downloads and caches the file here.
 MMDB_PATH = os.environ.get("GEOIP_MMDB", os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".cache", "dbip-country-lite.mmdb"
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ".cache", "dbip-country-lite.mmdb",
 ))
 
-#: ⚠️ در این‌جا یک `DBIP_URL_TEMPLATE` بود با همین توضیح که «CI ماهِ جاری و
-#: ماهِ پیش را امتحان می‌کند». حذف شد چون **هرگز مصرف نمی‌شد** و بدتر از آن،
-#: یک منبعِ حقیقتِ دوم بود:
-#:   • جست‌وجویِ کلِ مخزن دقیقاً ۱ مورد داد — همان خطِ تعریفِ خودش.
-#:   • این ماژول اصلاً دانلودکننده ندارد: هیچ `urllib`/`requests`/`urlopen`/
-#:     `gzip` در آن نیست و تنها کارش خواندنِ فایلِ آمادهٔ `MMDB_PATH` است.
-#:   • دانلودِ واقعی در `.github/workflows/aggregate.yml` (گامِ «Download GeoIP
-#:     database») انجام می‌شود و همان نشانی را **مستقلاً** می‌سازد. یعنی این
-#:     ثابت یک نسخهٔ بدلِ خاموش بود که اگر روزی نشانیِ DB-IP عوض شود، به‌روز
-#:     نمی‌شد و خواننده را به بیراهه می‌برد.
-#: منبعِ حقیقت برای نشانیِ دانلود = همان گامِ ورک‌فلو، نه این‌جا.
-
-#: شمارِ رشته‌های همروندِ DNS. اندازه‌گیری: ۶۴ رشته ← ۴٫۹ ثانیه برای ۱۳۶۵ میزبان.
-#: افزایش به ۱۲۸ نتیجه را بهتر نکرد (۸٫۴ ثانیه) چون گلوگاه، پاسخِ حل‌کنندهٔ
-#: بالادست است نه شمارِ رشته‌ها.
+#: DNS concurrency. Measured: 64 threads -> 4.9s for 1,365 hosts; 128 threads
+#: was slower (8.4s) because the upstream resolver is the bottleneck.
 DNS_WORKERS = int(os.environ.get("GEO_DNS_WORKERS", "64"))
 
-#: مهلتِ هر پرسشِ DNS به ثانیه.
+#: Per-lookup DNS budget, seconds.
 DNS_TIMEOUT = float(os.environ.get("GEO_DNS_TIMEOUT", "4"))
 
-#: ⚠️ در این‌جا `UNKNOWN = ("Global", "🌐")` بود. حذف شد چون در کلِ مخزن صفر
-#: مصرف‌کننده داشت (جست‌وجویِ واژه‌مرزی: ۱ مورد = خودِ تعریف) و هیچ‌یک از توابعِ
-#: همین ماژول هم آن را برنمی‌گرداند؛ `country_of_ip` / `country_of_addrs` /
-#: `country_for_host` در حالتِ ناشناس `None` می‌دهند، نه این تاپل.
-#: نکتهٔ ثبت‌شده برای مالک: مقدارِ ("Global", "🌐") در `core.py` دو بار
-#: به‌صورتِ literal تکرار شده است — هر دو داخلِ `detect_country_from_remark()`
-#: (به تابع ارجاع داده شد نه به شمارهٔ خط، چون شمارهٔ خط با هر ویرایش می‌شکند؛
-#: خودِ همین توضیح یک بار عددِ کهنه داشت و در بازبینی گرفته شد). ضمناً
-#: `country_for_endpoint()` رشتهٔ "Global" را به‌عنوان نگهبان مقایسه می‌کند.
-#: یکی‌کردنِ آن‌ها یعنی وابسته‌کردنِ `core` به
-#: `geo` در سطحِ ماژول، در حالی که `core` عمداً `geo` را فقط **تنبل** و درونِ
-#: تابع import می‌کند. پس این تصمیمِ معماری است نه پاک‌سازیِ کدِ مرده، و
-#: یک‌طرفه اعمال نشد.
+#: Fallback flag for an unknown or malformed country code.
+UNKNOWN_FLAG = "\N{GLOBE WITH MERIDIANS}"
 
 _reader = None
 _reader_tried = False
 _reader_lock = threading.Lock()
 
-#: نتیجهٔ نهاییِ هر میزبان. کلید: میزبانِ نرمال‌شده. مقدار: (کد, پرچم).
+#: Final verdict per host. normalised host -> (code, flag).
 _HOST_CC: Dict[str, Tuple[str, str]] = {}
 
-#: نشانی‌هایِ حل‌شدهٔ هر میزبان، تا در یک اجرا دو بار DNS نزنیم.
+#: Resolved addresses per host, so one run never resolves the same host twice.
 _HOST_ADDRS: Dict[str, Tuple[str, ...]] = {}
 
-#: میزبان‌هایی که یک بار امتحان شدند و *نشد* — کشِ منفی.
+#: Hosts that were tried once and failed, i.e. the negative cache.
 #:
-#: چرا لازم است: `warm_up` سه بار صدا زده می‌شود (all / heavy / light) و تنها
-#: موفقیت‌ها در `_HOST_CC` می‌نشستند. پس هر میزبانِ ناموفق در هر سه دور از نو
-#: DNS می‌خورد و از نو هم شمرده می‌شد. اندازه‌گیریِ واقعی روی همین داده:
+#: Needed because warm_up() runs three times (all / heavy / light) and only
+#: successes were cached, so every failing host was re-resolved and re-counted
+#: each round. That reported dns_failed=924 out of 1,375 named hosts, i.e. the
+#: stats over-counted. A host must be tried once and counted once.
 #:
-#:      میزبانِ نامی            ۱٬۳۷۵
-#:      دورِ ۱                  by_dns=۱۱۴۶  dns_failed=۲۲۷
-#:      دورِ ۲ (همان ورودی)     by_dns=۱۱۴۶  dns_failed=۴۵۴   ← ‎+۲۲۷ تکراری
-#:
-#: نتیجه‌اش در health.json عددِ dns_failed=۹۲۴ بود، در حالی که کلِ میزبانِ نامی
-#: ۱٬۳۷۵ است — یعنی آمار *بیش‌شماری* می‌کرد و خواننده را گمراه می‌کرد. با کشِ
-#: منفی، هر میزبان دقیقاً یک بار امتحان و یک بار شمرده می‌شود.
+#: Only *host* failures belong here. A missing database is not the host's fault
+#: and must stay retryable, see _label_batch().
 _HOST_FAILED: Set[str] = set()
 
-_stats = collections.Counter()
+_stats: collections.Counter = collections.Counter()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# پرچم از کدِ ISO
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+# Flag from ISO code
+# --------------------------------------------------------------------------- #
 
 def flag_of(code: str) -> str:
+    """Unicode flag for an ISO-3166-1 alpha-2 code, computed not tabulated.
+
+    The previous hand-written map covered 56 countries while live data contains
+    84 distinct ones, so 32 (CY, IL, KZ, AM, MO, IS, MT, PH, ...) were
+    unrepresentable. The regional-indicator formula removes the limit.
     """
-    پرچمِ یونیکد از کدِ دوحرفیِ ISO-3166-1 alpha-2.
-
-    محاسباتی است، نه جدولی. نقشهٔ دستیِ پیشین فقط ۵۶ کشور را می‌شناخت، ولی
-    اندازه‌گیریِ زندهٔ همین مخزن ۸۴ کشورِ متمایز پیدا کرد — یعنی ۳۲ کشور
-    (از جمله CY, IL, KZ, AM, MO, IS, MT, PH) با آن نقشه اصلاً قابلِ بیان
-    نبودند. فرمولِ regional-indicator این محدودیت را کاملاً برمی‌دارد.
-    """
-    c = (code or "").strip().upper()
-    if len(c) != 2 or not c.isalpha():
-        return "🌐"
-    return chr(0x1F1E6 + ord(c[0]) - 65) + chr(0x1F1E6 + ord(c[1]) - 65)
+    code = (code or "").strip().upper()
+    if len(code) != 2 or not code.isalpha():
+        return UNKNOWN_FLAG
+    return chr(0x1F1E6 + ord(code[0]) - 65) + chr(0x1F1E6 + ord(code[1]) - 65)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# پایگاهِ داده
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+# Database
+# --------------------------------------------------------------------------- #
 
 def _get_reader():
-    """
-    خوانندهٔ mmdb یا None.
+    """The mmdb reader, or None. Tries once and never raises.
 
-    فقط یک بار تلاش می‌کند؛ اگر فایل یا کتابخانه نبود، None برمی‌گرداند و
-    ماژول به حالتِ کاهش‌یافته می‌رود. هرگز استثنا به بیرون نمی‌دهد، چون نبودِ
-    یک پایگاهِ دادهٔ کمکی نباید انتشارِ کانفیگ‌ها را متوقف کند.
+    A missing auxiliary database must not stop config publication, so failure
+    degrades the module instead of breaking the run.
 
-    چرا `maxminddb` و نه `geoip2`
-    ─────────────────────────────
-    بستهٔ `geoip2` یک لایهٔ مدل روی `maxminddb` است و برای نصب، `aiohttp` و
-    `requests` را هم می‌آورد — دو وابستگیِ سنگین که برای یک جست‌وجویِ سادهٔ
-    «IP → کدِ کشور» هیچ کاری نمی‌کنند. آزمونِ مستقیم روی هر ۳۷۲۰ آی‌پیِ خامِ
-    واقعیِ همین مخزن:
-
-        توافق      ۳۷۲۰ / ۳۷۲۰   (۱۰۰٪ ، صفر اختلاف)
-        سرعت       maxminddb ۳۱٫۴ms   در برابر   geoip2 ۵۷٫۱ms   (۱٫۸۲ برابر)
-
-    پس خواندنِ مستقیم هم نتیجهٔ یکسان می‌دهد، هم سریع‌تر است، هم وابستگیِ
-    کمتری به requirements اضافه می‌کند.
+    Uses `maxminddb` rather than `geoip2`: geoip2 is a model layer that drags in
+    aiohttp and requests for what is one "IP -> country code" lookup. Checked on
+    all 3,720 real IP literals in this repo: 3,720/3,720 identical verdicts, and
+    maxminddb was 1.82x faster (31.4ms vs 57.1ms).
     """
     global _reader, _reader_tried
     if _reader is not None or _reader_tried:
@@ -197,74 +123,57 @@ def _get_reader():
             if os.path.exists(MMDB_PATH) and os.path.getsize(MMDB_PATH) > 1024:
                 _reader = maxminddb.open_database(MMDB_PATH)
                 _stats["db_loaded"] = 1
-        except Exception:
+        except Exception:  # noqa: BLE001 - optional dependency, degrade quietly
             _reader = None
     return _reader
 
 
 def database_available() -> bool:
-    """آیا پایگاهِ داده بارگذاری شد؟ برای گزارشِ سلامت."""
+    """Whether the database loaded. Reported in health.json."""
     return _get_reader() is not None
 
 
 def country_of_ip(ip: str) -> Optional[str]:
-    """کدِ کشورِ یک IP یا None. تابعِ خالص نسبت به پایگاهِ دادهٔ ثابت.
+    """Country code for an IP, or None.
 
-    خواندنِ مستقیمِ رکورد است، بی‌واسطهٔ مدل‌های `geoip2`. شکلِ رکوردِ
-    DB-IP Country Lite چنین است و کلیدِ موردِ نیاز تنها همین یکی است:
+    Reads the record directly. DB-IP Country Lite shape, of which only one key
+    matters::
 
-        {"continent": {...}, "country": {"is_in_european_union": …,
-                                         "iso_code": "DE", "names": {…}}}
+        {"continent": {...}, "country": {"iso_code": "DE", "names": {...}}}
 
-    دو حالتِ «نداریم» به‌طورِ طبیعی به None می‌رسند و بالادست به «Global»
-    می‌افتد، بی‌آنکه استثنایی بیرون بزند:
-      • نشانیِ خارج از پایگاهِ داده  → get() مقدارِ None می‌دهد
-      • نشانیِ خصوصی (مثلِ 127.0.0.1) → همان None
+    Both "not in the database" and "private address" reach None naturally, so
+    callers fall back to Global without an exception escaping.
     """
-    r = _get_reader()
-    if r is None or not ip:
+    reader = _get_reader()
+    if reader is None or not ip:
         return None
     try:
-        rec = r.get(ip)
-        if not rec:
+        record = reader.get(ip)
+        if not record:
             return None
-        return ((rec.get("country") or {}).get("iso_code")) or None
-    except Exception:
+        return ((record.get("country") or {}).get("iso_code")) or None
+    except Exception:  # noqa: BLE001
         return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
 # DNS
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
 
 @contextlib.contextmanager
 def _dns_timeout():
-    """
-    `DNS_TIMEOUT` را فقط برای همین بازه اعمال می‌کند و بعد **برمی‌گرداند**.
+    """Apply DNS_TIMEOUT for this block only, then restore the previous value.
 
-    چرا لازم است (F-12)
-    ───────────────────
-    `socket.getaddrinfo` پارامترِ `timeout` ندارد — با اجرا بررسی شد:
-        socket.getaddrinfo(host, port, family=0, type=0, proto=0, flags=0)
-    پس تنها راهِ مهارِ زمانِ آن، همان `setdefaulttimeout`ِ سراسری است. ولی
-    این تنظیم *سراسریِ کلِ فرآیند* است، نه رشته‌ای (سنجیده شد: مقدارِ
-    تنظیم‌شده در رشتهٔ اصلی را هر سه رشتهٔ دیگر هم می‌دیدند). پیش‌تر
-    `resolve_all` آن را می‌گذاشت و هرگز برنمی‌گرداند، پس هر سوکتی که پس از
-    نخستین جست‌وجوی DNS در همین فرآیند ساخته می‌شد تایم‌اوتِ ما را ارث
-    می‌برد (اندازه‌گیری‌شده: `None` → `4.0`).
+    `socket.getaddrinfo` takes no timeout argument, so the only lever is the
+    global `setdefaulttimeout`. That setting is per *process*, not per thread.
+    resolve_all() used to set it and never restore it, so every socket created
+    after the first DNS lookup inherited it (measured: None -> 4.0).
 
-    چرا این‌جا و نه داخلِ `resolve_all`
-    ───────────────────────────────────
-    وسوسهٔ طبیعی این است که همین prev/finally را داخلِ خودِ `resolve_all`
-    بگذاریم. آن **غلط** است و با اجرا رد شد: `resolve_all` از داخلِ
-    `ThreadPoolExecutor` صدا زده می‌شود، و چون همهٔ کارگرها *همان* مقدار را
-    می‌گذارند، `prev`ِ خوانده‌شده توسط یک کارگر می‌تواند مقدارِ کارگرِ دیگر
-    باشد و همان بازگردانده شود. سنجش: الگویِ سادهٔ درون‌کارگری در ۶ آزمایشِ
-    ۲۴کاره با ۸ رشته **۶ بار از ۶** نشت داد؛ همین الگو دورِ استخر **۰ بار
-    از ۶**. پس مرزِ درست بیرونِ استخر است.
-
-    این همان کاری است که `reachability.resolve_hosts` از قبل می‌کند
-    (prev/finally دورِ استخر، نه داخلِ کارگر)؛ اکنون دو ماژول هم‌رفتار شدند.
+    The restore must wrap the thread pool, not live inside the worker: workers
+    all set the same value, so one worker's `prev` can be another worker's
+    value. Measured: the in-worker pattern leaked 6 out of 6 trials, this one 0
+    out of 6. `reachability.resolve_hosts` already did it this way; the two
+    modules now behave the same.
     """
     prev = socket.getdefaulttimeout()
     socket.setdefaulttimeout(DNS_TIMEOUT)
@@ -275,184 +184,187 @@ def _dns_timeout():
 
 
 def is_ip_literal(host: str) -> bool:
-    """آیا میزبان خودش IP است؟ (IPv4 یا IPv6)"""
-    h = (host or "").strip()
-    if not h:
+    """Whether the host is already an IP address, v4 or v6."""
+    host = (host or "").strip()
+    if not host:
         return False
-    for fam in (socket.AF_INET, socket.AF_INET6):
+    for family in (socket.AF_INET, socket.AF_INET6):
         try:
-            socket.inet_pton(fam, h)
+            socket.inet_pton(family, host)
             return True
-        except Exception:
+        except Exception:  # noqa: BLE001
             continue
     return False
 
 
 def resolve_all(host: str) -> Tuple[str, ...]:
-    """
-    همهٔ نشانی‌هایِ IPv4 یک میزبان، مرتب‌شده.
+    """Every IPv4 address of a host, sorted.
 
-    مرتب‌سازی عمدی است: پاسخِ DNS برای میزبان‌های round-robin در هر فراخوانی
-    ترتیبِ دیگری دارد. با مرتب‌سازی، خروجی تابعی از *مجموعهٔ* رکوردها می‌شود
-    نه از ترتیبِ تصادفیِ پاسخ.
+    Sorting is deliberate: round-robin DNS returns a different order per call,
+    so sorting makes the result a function of the record *set*.
+
+    Does not touch `setdefaulttimeout`; this runs inside a thread pool and
+    mutating global state from a worker races. Timeouts are the caller's job via
+    ``with _dns_timeout():``.
     """
-    h = (host or "").strip().lower()
-    if not h:
+    host = (host or "").strip().lower()
+    if not host:
         return ()
-    if h in _HOST_ADDRS:
-        return _HOST_ADDRS[h]
-    if is_ip_literal(h):
-        _HOST_ADDRS[h] = (h,)
-        return (h,)
-    # عمداً این‌جا `setdefaulttimeout` صدا زده نمی‌شود: این تابع از داخلِ
-    # `ThreadPoolExecutor` هم فراخوانی می‌شود و دست‌کاریِ وضعیتِ سراسری از
-    # داخلِ کارگر مسابقه‌دار است (F-12 — شرحش در `_dns_timeout`). مهارِ زمان
-    # مسئولیتِ فراخوان است، با `with _dns_timeout():`.
+    if host in _HOST_ADDRS:
+        return _HOST_ADDRS[host]
+    if is_ip_literal(host):
+        _HOST_ADDRS[host] = (host,)
+        return (host,)
     try:
-        infos = socket.getaddrinfo(h, None, socket.AF_INET, socket.SOCK_STREAM)
-        addrs = tuple(sorted({i[4][0] for i in infos}))
-    except Exception:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+        addrs = tuple(sorted({info[4][0] for info in infos}))
+    except Exception:  # noqa: BLE001
         addrs = ()
-    _HOST_ADDRS[h] = addrs
+    _HOST_ADDRS[host] = addrs
     return addrs
 
 
 def country_of_addrs(addrs: Iterable[str]) -> Optional[str]:
-    """
-    کشورِ یک مجموعهٔ نشانی، با رأی‌گیریِ اکثریت.
+    """Country for an address set, by majority vote.
 
-    برخی CDN ها نشانی‌هایی در چند کشور دارند. انتخابِ «نشانیِ اول» ناپایدار
-    است؛ اکثریت پایدار است. تساوی با کوچک‌ترین IP (به ترتیبِ الفبا) شکسته
-    می‌شود تا نتیجه کاملاً معین باشد و به ترتیبِ ورودی بستگی نداشته باشد.
+    Some CDNs answer with addresses in several countries. "First address" is
+    unstable, a majority is stable. Ties break on the lowest IP so the result
+    never depends on input order.
     """
     votes: collections.Counter = collections.Counter()
     first: Dict[str, str] = {}
     for ip in sorted(set(addrs)):
-        cc = country_of_ip(ip)
-        if cc:
-            votes[cc] += 1
-            first.setdefault(cc, ip)
+        code = country_of_ip(ip)
+        if code:
+            votes[code] += 1
+            first.setdefault(code, ip)
     if not votes:
         return None
     top = max(votes.values())
-    return sorted((c for c, n in votes.items() if n == top), key=lambda c: first[c])[0]
+    winners = [code for code, count in votes.items() if count == top]
+    return sorted(winners, key=lambda code: first[code])[0]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# پیش‌گرم‌کردن (warm-up)
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+# Warm-up
+# --------------------------------------------------------------------------- #
+
+def _remember(host: str, code: Optional[str], success_stat: str,
+              failure_stat: str) -> None:
+    """Cache one verdict, positive or negative, and count it exactly once."""
+    if code:
+        _HOST_CC[host] = (code, flag_of(code))
+        _stats[success_stat] += 1
+    else:
+        _HOST_FAILED.add(host)
+        _stats[failure_stat] += 1
+
+
+def _resolve_batch(hosts: Sequence[str]) -> List[Tuple[str, ...]]:
+    """Resolve hosts concurrently, falling back to serial on pool failure."""
+    try:
+        with _dns_timeout():
+            with ThreadPoolExecutor(max_workers=max(1, DNS_WORKERS)) as pool:
+                return list(pool.map(resolve_all, hosts))
+    except Exception:  # noqa: BLE001
+        with _dns_timeout():
+            return [resolve_all(host) for host in hosts]
+
+
+def _label_literals(hosts: Sequence[str]) -> None:
+    """Label IP literals. No network needed, only the database."""
+    for host in hosts:
+        _HOST_ADDRS[host] = (host,)
+        _remember(host, country_of_ip(host), "by_ip_literal", "unknown_ip_literal")
+
+
+def _label_named(hosts: Sequence[str]) -> None:
+    """Label named hosts via concurrent DNS plus a majority vote."""
+    for host, addrs in zip(hosts, _resolve_batch(hosts)):
+        if not addrs:
+            _HOST_FAILED.add(host)
+            _stats["dns_failed"] += 1
+            continue
+        _remember(host, country_of_addrs(addrs), "by_dns", "unknown_after_dns")
+
 
 def warm_up(hosts: Iterable[str]) -> Dict[str, int]:
-    """
-    برچسبِ همهٔ میزبان‌ها را یک‌جا و همروند آماده می‌کند.
+    """Label every host up front, concurrently.
 
-    خطِ لوله این را یک بار پیش از برندینگ صدا می‌زند. اگر به‌جای آن برچسب
-    هنگامِ نیاز و یکی‌یکی گرفته شود، ۱۳۶۵ پرسشِ DNS پشتِ‌سرِ هم انجام می‌شود
-    (اندازه‌گیری: بیش از ۱۰ دقیقه) در حالی که همروند ۴٫۹ ثانیه است.
+    The pipeline calls this once before branding. Labelling lazily instead would
+    serialise 1,365 DNS lookups (measured at over 10 minutes) against 4.9s here.
     """
-    uniq: Set[str] = set()
-    for h in hosts:
-        h = (h or "").strip().lower()
-        # هم موفق‌ها و هم ناموفق‌ها رد می‌شوند: بارِ دوم نه پرسشِ تازه‌ای لازم
-        # است و نه شمارشِ تازه‌ای درست است.
-        if h and h not in _HOST_CC and h not in _HOST_FAILED:
-            uniq.add(h)
-    if not uniq:
+    pending: Set[str] = set()
+    for host in hosts:
+        host = (host or "").strip().lower()
+        # Skip both successes and known failures: the second pass needs neither
+        # a fresh lookup nor a fresh count.
+        if host and host not in _HOST_CC and host not in _HOST_FAILED:
+            pending.add(host)
+    if not pending:
         return dict(_stats)
 
-    ordered = sorted(uniq)                      # ترتیبِ معین
-    literal = [h for h in ordered if is_ip_literal(h)]
-    named = [h for h in ordered if not is_ip_literal(h)]
+    ordered = sorted(pending)  # deterministic order
+    literals = [host for host in ordered if is_ip_literal(host)]
+    named = [host for host in ordered if not is_ip_literal(host)]
 
-    # IP های خام: بی‌نیاز از شبکه
-    for h in literal:
-        cc = country_of_ip(h)
-        _HOST_ADDRS[h] = (h,)
-        if cc:
-            _HOST_CC[h] = (cc, flag_of(cc))
-            _stats["by_ip_literal"] += 1
-        else:
-            _HOST_FAILED.add(h)
-            _stats["unknown_ip_literal"] += 1
+    # Without the database nothing can be labelled, and that is not the hosts'
+    # fault: record it as skipped and leave the negative cache alone so a
+    # database that arrives later can still label them.
+    if _get_reader() is None:
+        _stats["skipped_no_db"] += len(ordered)
+        return dict(_stats)
 
-    # میزبان‌های نامی: DNS همروند
-    if named and _get_reader() is not None:
-        try:
-            with _dns_timeout():
-                with ThreadPoolExecutor(max_workers=max(1, DNS_WORKERS)) as ex:
-                    results = list(ex.map(resolve_all, named))
-        except Exception:
-            with _dns_timeout():
-                results = [resolve_all(h) for h in named]
-        for h, addrs in zip(named, results):
-            if not addrs:
-                _HOST_FAILED.add(h)
-                _stats["dns_failed"] += 1
-                continue
-            cc = country_of_addrs(addrs)
-            if cc:
-                _HOST_CC[h] = (cc, flag_of(cc))
-                _stats["by_dns"] += 1
-            else:
-                _HOST_FAILED.add(h)
-                _stats["unknown_after_dns"] += 1
-    elif named:
-        # اینجا عمداً در کشِ منفی ثبت نمی‌شود: علتِ شکست نبودِ پایگاهِ داده است،
-        # نه خودِ میزبان. اگر پایگاهِ داده بعداً بیاید، باید دوباره امتحان شود.
-        _stats["skipped_no_db"] += len(named)
-
+    _label_literals(literals)
+    if named:
+        _label_named(named)
     return dict(_stats)
 
 
 def country_for_host(host: str) -> Optional[Tuple[str, str]]:
-    """
-    (کد, پرچم) برای یک میزبان، یا None اگر معلوم نشد.
+    """``(code, flag)`` for a host, or None if it could not be determined.
 
-    اگر warm_up صدا زده نشده باشد، همین‌جا و به‌صورتِ تک‌نفره کار می‌کند تا
-    فراخوان‌های پراکنده (مثلاً در تست) هم درست جواب بگیرند.
-
-    این مسیر هم مثلِ warm_up آمار ثبت می‌کند. اگر ثبت نمی‌کرد، میزبانی که از
-    این راه برچسب می‌گرفت در health.json ناپیدا می‌ماند و جمعِ آمار با شمارِ
-    واقعیِ میزبان‌ها جور در نمی‌آمد — یعنی گزارش، بی‌آنکه خطایی بدهد، دروغ
-    می‌گفت.
+    Works standalone when warm_up() was never called, so scattered callers and
+    tests still get an answer. It records stats on this path too: otherwise a
+    host labelled here would be invisible in health.json and the totals would
+    silently disagree with the real host count.
     """
-    h = (host or "").strip().lower()
-    if not h:
+    host = (host or "").strip().lower()
+    if not host:
         return None
-    hit = _HOST_CC.get(h)
-    if hit is not None:
-        return hit
-    # کشِ منفی: میزبانی که یک بار شکست خورده، دوباره نه پرسیده و نه شمرده می‌شود.
-    # بی این بند، فراخوانیِ دوبارهٔ همان میزبانِ ناموفق آمار را دو برابر می‌کرد.
-    if h in _HOST_FAILED:
+    cached = _HOST_CC.get(host)
+    if cached is not None:
+        return cached
+    # Negative cache: a host that failed once is neither re-asked nor re-counted.
+    if host in _HOST_FAILED:
         return None
     if _get_reader() is None:
         _stats["skipped_no_db"] += 1
         return None
-    literal = is_ip_literal(h)
+
+    literal = is_ip_literal(host)
     with _dns_timeout():
-        addrs = resolve_all(h)
+        addrs = resolve_all(host)
     if not addrs:
-        _HOST_FAILED.add(h)
+        _HOST_FAILED.add(host)
         _stats["dns_failed"] += 1
         return None
-    cc = country_of_addrs(addrs)
-    if not cc:
-        _HOST_FAILED.add(h)
+    code = country_of_addrs(addrs)
+    if not code:
+        _HOST_FAILED.add(host)
         _stats["unknown_ip_literal" if literal else "unknown_after_dns"] += 1
         return None
-    res = (cc, flag_of(cc))
-    _HOST_CC[h] = res
+    result = (code, flag_of(code))
+    _HOST_CC[host] = result
     _stats["by_ip_literal" if literal else "by_dns"] += 1
-    return res
+    return result
 
 
-#: کلیدهایی که *همیشه* در stats() هستند، حتی اگر صفر باشند.
+#: Keys always present in stats(), even at zero.
 #
-# چرا ثابت: health.json را ابزارهای بیرونی پارس می‌کنند. اگر کلیدها فقط وقتی
-# ظاهر شوند که مقدارشان ناصفر است، مصرف‌کننده مجبور است برای هر کلید `if` بنویسد
-# و بدتر، «نبودِ dns_failed» با «صفر بودنِ dns_failed» یکی به نظر می‌رسد — در
-# حالی که اولی یعنی هنوز چیزی اندازه‌گیری نشده و دومی یعنی همه‌چیز سالم است.
+# Fixed schema because health.json is parsed by outside tools. If a key appeared
+# only when non-zero, "dns_failed missing" and "dns_failed == 0" would look the
+# same, while the first means nothing was measured and the second means all good.
 _STAT_KEYS = (
     "db_loaded",
     "by_ip_literal",
@@ -465,15 +377,14 @@ _STAT_KEYS = (
 
 
 def stats() -> Dict[str, int]:
-    """آمارِ کارِ انجام‌شده، برای درجِ در health.json.
+    """Work counters for health.json.
 
-    شمایِ خروجی ثابت است (همهٔ کلیدهای `_STAT_KEYS` حاضرند) و دو مقدارِ مشتق هم
-    اضافه می‌شود تا مصرف‌کننده لازم نباشد خودش جمع بزند:
+    Fixed shape, plus two derived totals so consumers do not re-add them::
 
-      hosts_resolved  = مجموعِ میزبان‌هایی که برچسبِ کشور گرفتند
-      hosts_unknown   = مجموعِ میزبان‌هایی که نگرفتند (به هر دلیل)
+        hosts_resolved  hosts that got a country label
+        hosts_unknown   hosts that did not, for any reason
     """
-    out = {k: int(_stats.get(k, 0)) for k in _STAT_KEYS}
+    out = {key: int(_stats.get(key, 0)) for key in _STAT_KEYS}
     out["db_loaded"] = 1 if _get_reader() is not None else 0
     out["hosts_resolved"] = out["by_ip_literal"] + out["by_dns"]
     out["hosts_unknown"] = (
@@ -484,7 +395,7 @@ def stats() -> Dict[str, int]:
 
 
 def reset() -> None:
-    """پاک‌سازیِ حافظه — برای تست‌های مستقل از هم."""
+    """Clear all caches. For tests that must not leak state into each other."""
     _HOST_CC.clear()
     _HOST_ADDRS.clear()
     _HOST_FAILED.clear()
