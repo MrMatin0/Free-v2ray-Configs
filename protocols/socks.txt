@@ -6,5 +6,5 @@
 # @Raydikalx - socks - 3 configs
 # --- below: schemes sing-box cannot parse (skipped by Hiddify) ---
 socks5://45.144.54.40:1080#DE 🇩🇪 | @Raydikalx | FA2724
-socks://ODg4ODo4ODg4@8.210.31.250:1080#HK 🇭🇰 | @Raydikalx | C50523
-socks://TjljeUY2anZneTNaRW1DTktlMDR6QklSOjFUZWxlZ3JhbV9Nb2ppVlBO@ch-zur.pvdata.host:1080#CH 🇨🇭 | @Raydikalx | B84571
+socks://Og@185.63.113.164:1085#IR 🇮🇷 | @Raydikalx | B3CB50
+socks://Og@185.8.173.203:1234#IR 🇮🇷 | @Raydikalx | C72DDC
